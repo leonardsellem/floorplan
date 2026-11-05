@@ -622,7 +622,7 @@ const AGENTS = {
   claude: { id: 'claude', name: 'Claude', app: 'Claude Code', cli: 'the Claude Code CLI', docs: 'https://docs.claude.com/en/docs/claude-code/overview',
       signIn: 'Run <code>claude</code> in a terminal once to sign in, then ask again.' },
 };
-const AGENT = AGENTS[window.FLOORPLAN_SERVER?.engine || window.FLOORPLAN_SERVER?.want || G.meta.agent] || AGENTS.claude;
+const AGENT = AGENTS[G.meta.agent] || AGENTS[window.FLOORPLAN_SERVER?.engine] || AGENTS[window.FLOORPLAN_SERVER?.want] || AGENTS.claude;
 const Cap = (t) => t[0].toUpperCase() + t.slice(1);
 if (!G) { document.body.innerHTML = '<p style="padding:2rem">No data. Run build.mjs.</p>'; return; }
 // a blueprint: planned from a PRD, so its files don't exist yet (no line counts, nothing to open in an editor)

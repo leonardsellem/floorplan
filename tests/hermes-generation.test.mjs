@@ -5,6 +5,7 @@ import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import path from 'node:path';
+import vm from 'node:vm';
 import { execFileSync } from 'node:child_process';
 import { REPO, SKILL, shopApp, makeProject, run, readGraph, readJson, writeJson, cleanup } from './helpers.mjs';
 
@@ -116,6 +117,30 @@ test('a Hermes refresh carries, prunes and flags descriptions, and calls body-on
     assert.ok(after.flows.some((f) => f.id === 'refund' && f.custom), 'the custom flow is still on the map');
     assert.ok(after.files.find((f) => f.p === 'shop-api/auth.js').note, 'the note is still pinned to its file');
     assert.equal(after.health.dismissed.length, 1, 'the dismissal survived the refresh');
+  } finally { cleanup(root); }
+});
+
+test('the built map names Hermes, even when its server would ask through Claude', () => {
+  const root = shopApp();
+  try {
+    run('scan.mjs', root);
+    run('build.mjs', root, '--agent', 'hermes');
+    const html = fs.readFileSync(path.join(root, 'floorplan', 'index.html'), 'utf8');
+    const at = html.indexOf('const G = window.FLOORPLAN;');
+    const end = html.indexOf('\n', html.indexOf('const AGENT = ', at));
+    assert.ok(at > 0 && end > at, 'the viewer picks the agent that answers');
+    const source = html.slice(at, end) + '\nglobalThis.picked = AGENT;';
+    const picked = (graph, server) => {
+      const win = { FLOORPLAN: graph, FLOORPLAN_SERVER: server };
+      win.window = win;
+      vm.runInNewContext(source, win);
+      return win.picked;
+    };
+    assert.equal(picked({ meta: { agent: 'hermes' } }, { engine: null, want: 'claude' }).name, 'Hermes',
+      'the agent that built the map wins over the one the server would ask');
+    assert.equal(picked({ meta: { agent: 'hermes' } }, null).name, 'Hermes', 'an exported map still names Hermes');
+    assert.equal(picked({ meta: { agent: 'claude' } }, { engine: null, want: 'claude' }).name, 'Claude');
+    assert.equal(picked({ meta: {} }, { engine: null, want: 'codex' }).name, 'Codex', 'unknown builder: the server decides');
   } finally { cleanup(root); }
 });
 
