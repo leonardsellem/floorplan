@@ -24,7 +24,9 @@ test('a code refresh keeps the Hermes identity', () => {
   const root = shopApp();
   try {
     run('scan.mjs', root);
-    run('build.mjs', root, '--agent', 'hermes');
+    const built = run('build.mjs', root, '--agent', 'hermes');
+    assert.match(built, /AGENT {2}Hermes: questions on the map run through Claude Code or Codex/,
+      'the report says where questions actually go: serve.mjs has no Hermes engine yet');
     assert.equal(readGraph(root).meta.agent, 'hermes');
     fs.appendFileSync(path.join(root, 'shop-api', 'routes', 'notes.js'), '\n// touched\n');
     const out = run('refresh.mjs', root, '--agent', 'hermes');
@@ -120,7 +122,7 @@ test('a Hermes refresh carries, prunes and flags descriptions, and calls body-on
   } finally { cleanup(root); }
 });
 
-test('the built map names Hermes, even when its server would ask through Claude', () => {
+test('the served map names the engine that answers, and an exported map names its builder', () => {
   const root = shopApp();
   try {
     run('scan.mjs', root);
@@ -136,11 +138,12 @@ test('the built map names Hermes, even when its server would ask through Claude'
       vm.runInNewContext(source, win);
       return win.picked;
     };
-    assert.equal(picked({ meta: { agent: 'hermes' } }, { engine: null, want: 'claude' }).name, 'Hermes',
-      'the agent that built the map wins over the one the server would ask');
-    assert.equal(picked({ meta: { agent: 'hermes' } }, null).name, 'Hermes', 'an exported map still names Hermes');
-    assert.equal(picked({ meta: { agent: 'claude' } }, { engine: null, want: 'claude' }).name, 'Claude');
-    assert.equal(picked({ meta: {} }, { engine: null, want: 'codex' }).name, 'Codex', 'unknown builder: the server decides');
+    assert.equal(picked({ meta: { agent: 'hermes' } }, { engine: 'claude', want: 'claude' }).name, 'Claude',
+      'the CLI the server answers with beats the agent that built the map');
+    assert.equal(picked({ meta: { agent: 'hermes' } }, { engine: null, want: 'claude' }).name, 'Claude',
+      'no CLI installed: name the one serve.mjs would run, not the builder');
+    assert.equal(picked({ meta: { agent: 'hermes' } }, null).name, 'Hermes', 'an exported map still names its builder');
+    assert.equal(picked({ meta: {} }, { engine: 'codex', want: 'codex' }).name, 'Codex');
   } finally { cleanup(root); }
 });
 

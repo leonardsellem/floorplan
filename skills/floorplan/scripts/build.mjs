@@ -481,7 +481,9 @@ report.push(graph.recent
 // equivalent (AGENTS.md is shared with the team) and Hermes has no such file at all, so a map they built
 // leaves every AGENTS*/CLAUDE* file alone, even one that already carries a Floorplan block.
 const AGENT_LABEL = { claude: 'Claude Code', codex: 'Codex', hermes: 'Hermes' };
-if (agent !== 'claude') report.push(`AGENT  ${AGENT_LABEL[agent]}: questions on the map run through ${AGENT_LABEL[agent]}`);
+// shortcut: serve.mjs has no Hermes engine until LS-3919, so a Hermes map still answers through Claude or Codex
+const ANSWERS_THROUGH = { codex: 'Codex', hermes: 'Claude Code or Codex' };
+if (agent !== 'claude') report.push(`AGENT  ${AGENT_LABEL[agent]}: questions on the map run through ${ANSWERS_THROUGH[agent]}`);
 if (scan.blueprint) report.push('BLUEPRINT  planned, not built yet: drawn from floorplan/plan.json');
 else if (agent === 'claude' && !args['no-claude-md']) report.push(`CLAUDE.LOCAL.MD  ${writeClaudeMd(root, outDir, { add: !!args['claude-md'] })}`);
 report.push(trackedWarning ? `GIT  ! ${trackedWarning}` : 'GIT  floorplan/ is kept out of git (it ignores itself)');
