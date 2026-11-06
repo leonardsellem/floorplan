@@ -15,9 +15,9 @@ def register(ctx) -> None:
     ctx.register_skill("floorplan", SKILL_MD, "Draw and update a codebase map (Floorplan).")
     ctx.register_cli_command(
         "floorplan",
-        "Floorplan map tools: probe this install (ask lands in LS-3919)",
+        "Floorplan map tools: probe this install, and answer the map's questions",
         setup_fn=setup_cli,
-        handler_fn=lambda args: probe(args, profile=ctx.profile_name,
-                                      plugin_version=ctx.manifest.version, skill_path=SKILL_MD),
+        handler_fn=lambda args: probe(args, profile=ctx.profile_name, plugin_version=ctx.manifest.version,
+                                      skill_path=SKILL_MD, ctx=ctx),
         description="Build, refresh and query a Floorplan map from Hermes.",
     )
