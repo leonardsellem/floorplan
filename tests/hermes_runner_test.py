@@ -274,6 +274,14 @@ class AskTest(unittest.TestCase):
         code, out, _ = self.run_ask([start(profile="someone-else")], [FINAL])
         self.assertEqual((code, out[-1]["type"], out[-1]["code"]), (1, "failure", "profile_mismatch"))
 
+    def test_a_start_without_the_profile_flag_carries_the_probed_profile(self):
+        # serve.mjs started without --profile sends the profile the probe named, not an empty string
+        payload = self.runner.probe_payload(profile="default-profile", plugin_version="9.9.9-test",
+                                            skill_path=REPO / "skills" / "floorplan" / "SKILL.md")
+        self.assertEqual(payload["profile"], "default-profile")
+        code, out, _ = self.run_ask([start(profile=payload["profile"])], [FINAL], profile=payload["profile"])
+        self.assertEqual((code, self.kinds(out)), (0, ["ready", "result"]))
+
     def test_a_symlink_in_any_component_is_refused_and_never_followed(self):
         Path(self.root, "outside").mkdir()
         Path(self.root, "outside", "canary.txt").write_text("CANARY_OUTSIDE")

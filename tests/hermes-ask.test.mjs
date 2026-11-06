@@ -201,6 +201,43 @@ t('Stop kills that request’s process group, and another request keeps running'
   assert.equal(pick(a.events, 'answer').length, 0);
 });
 
+t('a Stop with no id, or with an id this server never issued, stops nothing', async () => {
+  const root = shop();
+  const pidsFile = path.join(root, 'pids.json');
+  const s = await serve(root, { FAKE_HERMES_PIDS: pidsFile });
+
+  const a = open(s, 'HANG until a stop that names it');
+  const started = await a.waitFor('start');
+  let pids = null;
+  for (let i = 0; i < 100 && !pids; i++) { try { pids = JSON.parse(fs.readFileSync(pidsFile, 'utf8')); } catch { await new Promise((r) => setTimeout(r, 50)); } }
+  assert.ok(pids?.main.pid, 'the worker is running');
+
+  // the page sends {} for a Stop pressed before the start event, and can name a request that already ended
+  const headers = { 'content-type': 'application/json', 'x-floorplan-token': s.token };
+  for (const body of ['{}', JSON.stringify({ id: 'not-a-request' })]) {
+    assert.equal((await fetch(s.base + '/api/cancel', { method: 'POST', headers, body })).status, 204, body);
+  }
+  // this worker ignores SIGTERM, so a stop that had reached it would have killed the group 2 s later
+  await new Promise((r) => setTimeout(r, 3000));
+  let alive = false;
+  try { process.kill(pids.main.pid, 0); alive = true; } catch {}
+  assert.ok(alive, 'a stop that named no running request killed another tab’s request');
+  assert.equal(pick(a.events, 'answer').length, 0);
+  assert.ok(started.id, 'the request kept its own id');
+});
+
+t('a server started without --profile answers with the profile the probe reports', async () => {
+  const root = shop();
+  const s = await serve(root, { FLOORPLAN_PROFILE: '' });
+  assert.equal(s.page.engine, 'hermes');
+  assert.equal(s.page.profile, 'default-profile');
+
+  const events = await ask(s, 'What is this?');
+  assert.ok(pick(events, 'answer').length, 'the documented no-flag start answers');
+  assert.equal(pick(events, 'failure').length, 0);
+  assert.equal(pick(events, 'answer')[0].profile, 'default-profile');
+});
+
 t('a result that arrives after Stop never renders', async () => {
   const root = shop();
   const s = await serve(root);

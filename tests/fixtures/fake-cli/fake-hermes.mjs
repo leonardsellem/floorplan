@@ -12,12 +12,14 @@ const SKILL = path.join(REPO, 'skills', 'floorplan');
 const args = process.argv.slice(2);
 const opt = (name) => (args.includes(name) ? args[args.indexOf(name) + 1] : '');
 const profile = opt('--profile');
+// the real CLI answers on its own active profile when no --profile is passed, so this stand-in has one too
+const activeProfile = profile || 'default-profile';
 const log = (o) => { if (process.env.FAKE_HERMES_LOG) fs.appendFileSync(process.env.FAKE_HERMES_LOG, JSON.stringify(o) + '\n'); };
 const sha256 = (b) => crypto.createHash('sha256').update(b).digest('hex');
 
 if (args.includes('--version')) { console.log('0.22.5-test'); process.exit(0); }
 if (args.includes('probe')) {
-  console.log(JSON.stringify({ plugin: 'floorplan', protocol: 1, profile, skill_dir: SKILL, ask: 'ready' }));
+  console.log(JSON.stringify({ plugin: 'floorplan', protocol: 1, profile: activeProfile, skill_dir: SKILL, ask: 'ready' }));
   process.exit(0);
 }
 
@@ -59,10 +61,12 @@ function handle(frame) {
   if (frame.type === 'start') {
     id = frame.id;
     seq = 0;
+    // the real runner refuses any start frame whose profile is not the CLI's own (runner.py:279)
+    if (frame.profile !== activeProfile) { send({ type: 'failure', code: 'profile_mismatch', message: 'profile_mismatch' }); return; }
     const q = String(frame.question || '');
     if (q.startsWith('FAIL:')) { send({ type: 'failure', code: q.slice(5).split(' ')[0], message: 'scripted failure' }); return; }
     if (q.startsWith('HANG')) { hang(); return; }
-    send({ type: 'ready', profile: profile || 'test-profile', plugin: 'floorplan', protocol: 1 });
+    send({ type: 'ready', profile: activeProfile, plugin: 'floorplan', protocol: 1 });
     if (q.startsWith('SLOW')) {
       // a result after the tab has already stopped: the server must drop it
       setTimeout(() => send({ type: 'result', payload: answerPayload(), provider: 'fake-provider', model: 'fake-model-1' }), 1500);

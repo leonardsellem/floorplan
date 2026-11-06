@@ -100,7 +100,7 @@ const wantPort = Number(opt('port', 4378));
 const idleExit = Number(opt('idle-exit', 0)) * 60000; // stop this long after the last tab closes (0 = never)
 const selfHash = crypto.createHash('sha1').update(fs.readFileSync(fileURLToPath(import.meta.url))).digest('hex').slice(0, 12);
 const model = opt('model', process.env.FLOORPLAN_MODEL || '');
-const profile = opt('profile', process.env.FLOORPLAN_PROFILE || '');
+let profile = opt('profile', process.env.FLOORPLAN_PROFILE || '');
 const token = crypto.randomBytes(16).toString('hex');
 const TYPES = { '.html': 'text/html; charset=utf-8', '.json': 'application/json', '.js': 'text/javascript', '.mjs': 'text/javascript', '.css': 'text/css', '.svg': 'image/svg+xml' };
 
@@ -179,6 +179,9 @@ const ENGINES = {
       const bin = resolveCli(given('hermes') || [...which('hermes'), path.join(HOME, '.local', 'bin', 'hermes')], []);
       const info = bin && hermesProbe(bin);
       hermesInstall = info ? { bin, info } : null;
+      // the documented start passes no --profile: the worker will run under the CLI's own profile, so
+      // that is the name the start frame must carry (runner.py refuses any other)
+      if (info && !profile && typeof info.profile === 'string') profile = info.profile;
       return info ? bin : null;
     },
     run: null, // see hermesAsk
@@ -470,13 +473,13 @@ const CONV_MAX = 100, CONV_IDLE = 30 * 60000, CONV_TURNS = 4;
 function historyFor(handle, mode) {
   const c = handle ? conversations.get(handle) : null;
   if (!c) return null;
-  if (c.root !== root || c.digest !== graphDigest || c.profile !== profile || c.mode !== mode) return null;
+  if (c.root !== root || c.digest !== graphDigest || c.engine !== engine || c.profile !== profile || c.mode !== mode) return null;
   if (Date.now() - c.at > CONV_IDLE) { conversations.delete(handle); return null; }
   return c.turns;
 }
 function remember(handle, mode, turns) {
   conversations.delete(handle);
-  conversations.set(handle, { root, digest: graphDigest, profile, mode, turns: turns.slice(-CONV_TURNS), at: Date.now() });
+  conversations.set(handle, { root, digest: graphDigest, engine, profile, mode, turns: turns.slice(-CONV_TURNS), at: Date.now() });
   for (const [k, v] of conversations) if (conversations.size > CONV_MAX && Date.now() - v.at > CONV_IDLE) conversations.delete(k);
   while (conversations.size > CONV_MAX) conversations.delete(conversations.keys().next().value);
 }
@@ -786,9 +789,12 @@ const server = http.createServer((req, res) => {
       req.on('data', (d) => { raw += d; if (raw.length > 2000) req.destroy(); });
       req.on('end', () => {
         let body = {}; try { body = JSON.parse(raw); } catch {}
-        const rec = body.id && running.get(String(body.id));
-        if (rec) { rec.silent = true; stopRequest(rec); }       // just that request, and quietly
-        else for (const c of running.values()) stopRequest(c);  // other engines keep their current behaviour
+        // Stop names one request. Nothing (no id, or an id this server never issued) stops nothing, so a
+        // Stop pressed before the start frame's id arrives cannot take another tab's request down; a
+        // kill-all is opt-in via {all: true}.
+        const rec = typeof body.id === 'string' && body.id ? running.get(body.id) : null;
+        if (rec) { rec.silent = true; stopRequest(rec); }
+        else if (body.all === true) for (const c of running.values()) stopRequest(c);
         res.writeHead(204); res.end();
       });
       return;
