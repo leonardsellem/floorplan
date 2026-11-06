@@ -25,8 +25,8 @@ test('a code refresh keeps the Hermes identity', () => {
   try {
     run('scan.mjs', root);
     const built = run('build.mjs', root, '--agent', 'hermes');
-    assert.match(built, /AGENT {2}Hermes: questions on the map run through Claude Code or Codex/,
-      'the report says where questions actually go: serve.mjs has no Hermes engine yet');
+    assert.match(built, /AGENT {2}Hermes: questions on the map run through Hermes/,
+      'the report says where questions actually go: the map server runs Hermes itself');
     assert.equal(readGraph(root).meta.agent, 'hermes');
     fs.appendFileSync(path.join(root, 'shop-api', 'routes', 'notes.js'), '\n// touched\n');
     const out = run('refresh.mjs', root, '--agent', 'hermes');

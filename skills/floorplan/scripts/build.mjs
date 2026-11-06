@@ -462,6 +462,8 @@ fs.writeFileSync(path.join(outDir, 'query.mjs'), `${graphQuery}
 // ---- cli ----
 ${fs.readFileSync(path.join(SKILL_DIR, 'assets', 'query-cli.mjs'), 'utf8')}`);
 fs.copyFileSync(path.join(SKILL_DIR, 'assets', 'serve.mjs'), path.join(outDir, 'serve.mjs'));
+// Hermes Ask's deny list, schema validator and read tickets: serve.mjs imports it as a sibling
+fs.copyFileSync(path.join(SKILL_DIR, 'assets', 'hermes-boundary.mjs'), path.join(outDir, 'hermes-boundary.mjs'));
 // a blueprint can be changed from the map: serve.mjs redraws it with this skill's plan.mjs and build.mjs
 if (scan.blueprint) { fs.mkdirSync(path.join(outDir, '.cache'), { recursive: true }); fs.writeFileSync(path.join(outDir, '.cache', 'skill.json'), JSON.stringify({ dir: SKILL_DIR })); }
 // the logo and tab icon are inlined so the map stays one self-contained file
@@ -481,8 +483,7 @@ report.push(graph.recent
 // equivalent (AGENTS.md is shared with the team) and Hermes has no such file at all, so a map they built
 // leaves every AGENTS*/CLAUDE* file alone, even one that already carries a Floorplan block.
 const AGENT_LABEL = { claude: 'Claude Code', codex: 'Codex', hermes: 'Hermes' };
-// shortcut: serve.mjs has no Hermes engine until LS-3919, so a Hermes map still answers through Claude or Codex
-const ANSWERS_THROUGH = { codex: 'Codex', hermes: 'Claude Code or Codex' };
+const ANSWERS_THROUGH = { codex: 'Codex', hermes: 'Hermes' };
 if (agent !== 'claude') report.push(`AGENT  ${AGENT_LABEL[agent]}: questions on the map run through ${ANSWERS_THROUGH[agent]}`);
 if (scan.blueprint) report.push('BLUEPRINT  planned, not built yet: drawn from floorplan/plan.json');
 else if (agent === 'claude' && !args['no-claude-md']) report.push(`CLAUDE.LOCAL.MD  ${writeClaudeMd(root, outDir, { add: !!args['claude-md'] })}`);
