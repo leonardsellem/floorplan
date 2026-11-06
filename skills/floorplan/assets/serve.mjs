@@ -505,14 +505,14 @@ function groupAlive(rec) {
 function shutdown() {
   if (shuttingDown) return;
   shuttingDown = true;
-  const recs = [...running.values()];
-  for (const rec of recs) { rec.silent = true; stopRequest(rec); }
-  if (!recs.length) return process.exit(0);
+  server.close();
+  const stopped = new Set();
   const deadline = Date.now() + 3000;
-  // a descendant can outlive the worker that started it: wait on the group, not only on the group leader
+  // re-snapshot each poll: an ask accepted just before the guard can still spawn during the drain
   const poll = () => {
-    if (!recs.every((rec) => !groupAlive(rec)) && Date.now() < deadline) return void setTimeout(poll, 50);
-    for (const rec of recs) killRequest(rec);
+    for (const rec of running.values()) if (!stopped.has(rec)) { stopped.add(rec); rec.silent = true; stopRequest(rec); }
+    if ([...stopped].some((rec) => groupAlive(rec)) && Date.now() < deadline) return void setTimeout(poll, 50);
+    for (const rec of stopped) killRequest(rec);
     process.exit(0);
   };
   poll();
@@ -851,6 +851,7 @@ const server = http.createServer((req, res) => {
       return;
     }
     if (req.method === 'POST' && url.pathname === '/api/ask') {
+      if (shuttingDown) { res.writeHead(503, { 'Content-Type': 'application/json' }); return res.end(JSON.stringify({ error: 'The map server is shutting down.' })); }
       let raw = '';
       req.on('data', (d) => { raw += d; if (raw.length > 20000) req.destroy(); });
       req.on('end', () => { let body = {}; try { body = JSON.parse(raw); } catch {} ask(req, res, body); });
