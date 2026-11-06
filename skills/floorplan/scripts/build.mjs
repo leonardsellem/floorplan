@@ -478,10 +478,14 @@ report.push(graph.recent
   ? `RECENT WORK  ${graph.recent.items.length} card(s) highlighted across ${graph.recent.tasks.length} task(s)`
   : `RECENT WORK  none highlighted${fs.existsSync(recentFile) ? '' : ' (no recent-work.json)'}`);
 // point future Claude Code sessions in this project at the map. Codex has no personal, uncommitted
-// equivalent (AGENTS.md is shared with the team), so a map built by Codex leaves the project's notes alone.
-if (agent === 'codex') report.push('AGENT  Codex: questions on the map run through Codex');
+// equivalent (AGENTS.md is shared with the team) and Hermes has no such file at all, so a map they built
+// leaves every AGENTS*/CLAUDE* file alone, even one that already carries a Floorplan block.
+const AGENT_LABEL = { claude: 'Claude Code', codex: 'Codex', hermes: 'Hermes' };
+// shortcut: serve.mjs has no Hermes engine until LS-3919, so a Hermes map still answers through Claude or Codex
+const ANSWERS_THROUGH = { codex: 'Codex', hermes: 'Claude Code or Codex' };
+if (agent !== 'claude') report.push(`AGENT  ${AGENT_LABEL[agent]}: questions on the map run through ${ANSWERS_THROUGH[agent]}`);
 if (scan.blueprint) report.push('BLUEPRINT  planned, not built yet: drawn from floorplan/plan.json');
-else if (agent !== 'codex' && !args['no-claude-md']) report.push(`CLAUDE.LOCAL.MD  ${writeClaudeMd(root, outDir, { add: !!args['claude-md'] })}`);
+else if (agent === 'claude' && !args['no-claude-md']) report.push(`CLAUDE.LOCAL.MD  ${writeClaudeMd(root, outDir, { add: !!args['claude-md'] })}`);
 report.push(trackedWarning ? `GIT  ! ${trackedWarning}` : 'GIT  floorplan/ is kept out of git (it ignores itself)');
 report.push('');
 report.push(`✓ wrote ${path.relative(root, path.join(outDir, 'index.html'))} (${fmtNum(Math.round(html.length / 1024))} KB) and graph.json`);
