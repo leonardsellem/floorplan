@@ -100,11 +100,12 @@ test('it runs a fixed list of programs, and never through a shell', () => {
   assert.deepEqual([...new Set(names)].sort(), ['execFileSync', 'spawn'], `child_process functions used. ${UPDATE}`);
   assert.deepEqual(find(/(?<![.\w])(exec|execSync|fork|spawnSync|execFile)\(/).map((x) => `${x.file}:${x.line} ${x.text}`), [], `other ways to start programs. ${UPDATE}`);
   assert.deepEqual(find(/shell:\s*true/).map((x) => `${x.file}:${x.line}`), [], 'never through a shell');
-  // what each call starts: where/which, the Claude Code or Codex CLI, Node running the skill's own scripts,
-  // git, and the system's "open this address in the browser" command
+  // what each call starts: where/which, the Claude Code, Codex or Hermes CLI, Node running the skill's own
+  // scripts, git, and the system's "open this address in the browser" command
   const ALLOWED = new Set([
     "process.platform === 'win32' ? 'where' : 'which'",
     'cli.cmd',
+    'bin.cmd',
     'process.execPath',
     'node',
     "'git'",
@@ -123,13 +124,21 @@ test('it runs a fixed list of programs, and never through a shell', () => {
 
 test('no code is downloaded, decoded or built from text at run time', () => {
   assert.deepEqual(find(/(?<![.\w])eval\(/).map((x) => `${x.file}:${x.line}`), [], `eval. ${UPDATE}`);
-  // the one exception: serve.mjs loads the map's own lookup code from floorplan/query.mjs, a file the build wrote
+  // the two exceptions: serve.mjs loads the map's own lookup code from floorplan/query.mjs (a file the build
+  // wrote), and imports the installed skill's health.mjs to classify bytes for Hermes Ask. That folder comes
+  // from the install's model-free probe, never from the map, the browser or .cache/skill.json.
   assert.deepEqual(find(/new Function\(/).map((x) => x.file), ['assets/serve.mjs'], `new Function. ${UPDATE}`);
   assert.match(read(path.join(SKILL, 'assets', 'serve.mjs')), /const coreSrc = fs\.readFileSync\(path\.join\(here, 'query\.mjs'\), 'utf8'\)/);
-  assert.deepEqual(find(/\bimport\s*\(/).map((x) => `${x.file}:${x.line}`), [], `dynamic import. ${UPDATE}`);
+  const dynamic = find(/\bimport\s*\(/);
+  assert.deepEqual(dynamic.map((x) => x.file), ['assets/serve.mjs'], `dynamic import. ${UPDATE}`);
+  assert.match(read(path.join(SKILL, 'assets', 'serve.mjs')).split('\n')[dynamic[0].line - 1],
+    /pathToFileURL\(path\.join\(hermesInstall\.info\.skill_dir, 'scripts', 'lib', 'health\.mjs'\)\)\.href/,
+    `the only dynamic import is the probed skill's own health.mjs. ${UPDATE}`);
   assert.deepEqual(find(/from\s+['"](?:node:)?(vm|worker_threads|inspector|wasi)['"]|new Worker\(|WebAssembly\./).map((x) => `${x.file}: ${x.text}`), [], `other ways to run code. ${UPDATE}`);
-  // decoding base64: only Health reading the middle of a token it found, to tell what kind of token it is
-  assert.deepEqual(find(/\batob\(|['"]base64['"]\s*\)/).filter((x) => x.file !== 'scripts/build.mjs').map((x) => x.file), ['scripts/lib/health.mjs'], `base64 decoding. ${UPDATE}`);
+  // decoding base64: only Health reading the middle of a token it found, to tell what kind of token it is,
+  // and the boundary decoding the bytes its own Python reader sent it (hash-checked before use)
+  assert.deepEqual(find(/\batob\(|['"]base64['"]\s*\)/).filter((x) => x.file !== 'scripts/build.mjs').map((x) => x.file),
+    ['assets/hermes-boundary.mjs', 'scripts/lib/health.mjs'], `base64 decoding. ${UPDATE}`);
   // no long opaque strings that could hide a payload (the build inlines the logo and fonts from files)
   assert.deepEqual(find(/[A-Za-z0-9+/=]{160,}/).map((x) => `${x.file}:${x.line}`), [], 'long encoded strings');
 });

@@ -16,7 +16,8 @@ import fs from 'node:fs';
 import path from 'node:path';
 import crypto from 'node:crypto';
 import { spawn, execFileSync } from 'node:child_process';
-import { fileURLToPath } from 'node:url';
+import { fileURLToPath, pathToFileURL } from 'node:url';
+import { Boundary, LIMITS, compileSchema, validateSchema, answerProblems, flowProblems, frameProblem } from './hermes-boundary.mjs';
 
 const here = path.dirname(fileURLToPath(import.meta.url));
 const root = path.resolve(here, '..');
@@ -99,6 +100,7 @@ const wantPort = Number(opt('port', 4378));
 const idleExit = Number(opt('idle-exit', 0)) * 60000; // stop this long after the last tab closes (0 = never)
 const selfHash = crypto.createHash('sha1').update(fs.readFileSync(fileURLToPath(import.meta.url))).digest('hex').slice(0, 12);
 const model = opt('model', process.env.FLOORPLAN_MODEL || '');
+const profile = opt('profile', process.env.FLOORPLAN_PROFILE || '');
 const token = crypto.randomBytes(16).toString('hex');
 const TYPES = { '.html': 'text/html; charset=utf-8', '.json': 'application/json', '.js': 'text/javascript', '.mjs': 'text/javascript', '.css': 'text/css', '.svg': 'image/svg+xml' };
 
@@ -144,7 +146,18 @@ function codexApp() {
 // The agents that can answer, one entry each: what it's called, where to get it, how to find its CLI, how to
 // run one request (run, below), and whether its answers are held to a schema (structured). Changing a
 // blueprint from the map needs that, so Change is offered only with a structured engine. schemaFile: the
-// CLI reads its schema from a file rather than the command line.
+// CLI reads its schema from a file rather than the command line. protocol: the engine speaks LS-3919's
+// newline-delimited JSON worker protocol instead (hermesAsk), and its find() also probes the install.
+let hermesInstall = null;
+function hermesProbe(bin) {
+  try {
+    const out = execFileSync(bin.cmd, [...bin.args, ...(profile ? ['--profile', profile] : []), 'floorplan', 'probe'],
+      { encoding: 'utf8', timeout: 20000, stdio: ['ignore', 'pipe', 'ignore'], windowsHide: true });
+    const p = JSON.parse(out);
+    if (p?.plugin !== 'floorplan' || p.protocol !== 1 || p.ask !== 'ready' || typeof p.skill_dir !== 'string') return null;
+    return p;
+  } catch { return null; }
+}
 const ENGINES = {
   claude: {
     name: 'Claude Code CLI', site: 'https://docs.claude.com/en/docs/claude-code', structured: true,
@@ -160,6 +173,16 @@ const ENGINES = {
     find: () => resolveCli(given('codex') || [...which('codex'), ...codexApp()], ['@openai', 'codex', 'bin', 'codex.js']),
     run: codexRun,
   },
+  hermes: {
+    name: 'Hermes', site: 'https://hermes-agent.nousresearch.com/docs', structured: true, protocol: true, change: false,
+    find: () => {
+      const bin = resolveCli(given('hermes') || [...which('hermes'), path.join(HOME, '.local', 'bin', 'hermes')], []);
+      const info = bin && hermesProbe(bin);
+      hermesInstall = info ? { bin, info } : null;
+      return info ? bin : null;
+    },
+    run: null, // see hermesAsk
+  },
 };
 // --engine (or FLOORPLAN_ENGINE) decides; otherwise the agent that built the map, then the others in order
 const builtBy = (() => { try { return JSON.parse(fs.readFileSync(path.join(here, 'graph.json'), 'utf8')).meta?.agent; } catch { return null; } })();
@@ -168,7 +191,16 @@ const isEngine = (k) => typeof k === 'string' && Object.hasOwn(ENGINES, k);
 const want = isEngine(asked) ? asked : isEngine(builtBy) ? builtBy : 'claude';
 let engine = null, cli = null;
 for (const k of isEngine(asked) ? [asked] : [want, ...Object.keys(ENGINES).filter((k) => k !== want)]) { cli = ENGINES[k].find(); if (cli) { engine = k; break; } }
-const canChange = !engine || ENGINES[engine].structured;
+const canChange = !engine || (ENGINES[engine].structured && ENGINES[engine].change !== false);
+// Source-aware Hermes Ask classifies the bytes it opens with the skill's own health scanner, loaded only
+// from the folder the install's model-free probe named (never from the map or from .cache/skill.json).
+let findIssues = null;
+if (engine === 'hermes') {
+  try {
+    const health = await import(pathToFileURL(path.join(hermesInstall.info.skill_dir, 'scripts', 'lib', 'health.mjs')).href);
+    findIssues = typeof health.findIssues === 'function' ? health.findIssues : null;
+  } catch { findIssues = null; }
+}
 // Started from inside a Claude Code or Codex session? Don't let the CLI think it's nested in it.
 function cliEnv() {
   const env = { ...process.env };
@@ -180,21 +212,34 @@ if (cli) { try { version = execFileSync(cli.cmd, [...cli.args, '--version'], { e
 
 // The page, the graph, and the instructions and answer schema (from query.mjs's inlined graph-query
 // code). Loaded at start and again whenever the map is rebuilt.
-const inject = `<script>window.FLOORPLAN_SERVER=${JSON.stringify({ token, cli: !!cli, engine, want, version, model: model || null, change: canChange })};</script>`;
-let page, G, core, MODES;
+const inject = `<script>window.FLOORPLAN_SERVER=${JSON.stringify({ token, cli: !!cli, engine, want, version, model: model || null, profile: profile || null, source: engine === 'hermes' ? !!findIssues : null, change: canChange })};</script>`;
+const ENGINE_LANG = (k) => (k === 'hermes' ? 'hermes' : 'cli');
+// Server-owned follow-up store: a handle is bound to root, graph digest, engine, profile and mode.
+const conversations = new Map();
+let page, G, core, MODES, graphDigest = '', fingerprints = new Map();
 function load() {
   const html = fs.readFileSync(path.join(here, 'index.html'), 'utf8');
-  const g = JSON.parse(fs.readFileSync(path.join(here, 'graph.json'), 'utf8'));
+  const rawGraph = fs.readFileSync(path.join(here, 'graph.json'), 'utf8');
+  const g = JSON.parse(rawGraph);
+  graphDigest = crypto.createHash('sha256').update(rawGraph).digest('hex');
+  try {
+    const scan = JSON.parse(fs.readFileSync(path.join(here, '.cache', 'scan.json'), 'utf8'));
+    fingerprints = new Map((scan.files || []).filter((f) => f.h).map((f) => [f.path, f.h]));
+  } catch { fingerprints = new Map(); }
   const coreSrc = fs.readFileSync(path.join(here, 'query.mjs'), 'utf8').split('// ---- cli ----')[0];
   const c = new Function(`${coreSrc.replace(/^import .*$/gm, '')}; return { FLOORPLAN_ANSWER_SCHEMA, FLOORPLAN_FLOW_SCHEMA, FLOORPLAN_CHANGE_SCHEMA, floorplanAskInstructions, floorplanFlowInstructions, floorplanChangeInstructions, createGraphQuery };`)();
   c.q = c.createGraphQuery(g);
+  // an unsupported assertion in any of the three schemas throws here, at server start, never later
+  for (const s of [c.FLOORPLAN_ANSWER_SCHEMA, c.FLOORPLAN_FLOW_SCHEMA, c.FLOORPLAN_CHANGE_SCHEMA]) compileSchema(s);
   page = html.replace('</head>', inject + '</head>');
   G = g; core = c;
+  const said = ENGINE_LANG(engine);
+  conversations.clear();
   // kinds of request: a question (answer + board), a new guided flow, and for a blueprint, a change to the
   // plan. Codex reads its schema from a file.
   MODES = {
-    ask: { instructions: core.floorplanAskInstructions(G, 'cli'), schema: core.FLOORPLAN_ANSWER_SCHEMA, file: path.join(here, '.cache', 'answer-schema.json') },
-    flow: { instructions: core.floorplanFlowInstructions(G, 'cli'), schema: core.FLOORPLAN_FLOW_SCHEMA, file: path.join(here, '.cache', 'flow-schema.json') },
+    ask: { instructions: core.floorplanAskInstructions(G, said), schema: core.FLOORPLAN_ANSWER_SCHEMA, file: path.join(here, '.cache', 'answer-schema.json') },
+    flow: { instructions: core.floorplanFlowInstructions(G, said), schema: core.FLOORPLAN_FLOW_SCHEMA, file: path.join(here, '.cache', 'flow-schema.json') },
     ...(G.meta?.blueprint && canChange ? { change: { instructions: core.floorplanChangeInstructions(G), schema: core.FLOORPLAN_CHANGE_SCHEMA, file: path.join(here, '.cache', 'change-schema.json') } } : {}),
   };
   if (ENGINES[engine]?.schemaFile) {
@@ -370,7 +415,7 @@ function runAgent(res, send, body) {
     const run = ENGINES[engine].run(body, MODES[body.mode] || MODES.ask);
     const child = spawn(cli.cmd, run.args, { cwd: root, env: cliEnv(), stdio: ['pipe', 'pipe', 'pipe'], windowsHide: true });
     const id = crypto.randomBytes(6).toString('hex');
-    running.set(id, child);
+    running.set(id, { child, engine });
     send('start', { id });
     child.stdin.end(run.input);
     let buf = '', stderr = '', done = false;
@@ -409,10 +454,149 @@ function ask(req, res, body) {
   res.writeHead(200, { 'Content-Type': 'text/event-stream', 'Cache-Control': 'no-store', Connection: 'keep-alive' });
   const send = (event, data) => { if (!res.writableEnded) res.write(`event: ${event}\ndata: ${JSON.stringify(data)}\n\n`); };
   if (!cli) { send('failure', { code: 'cli_missing', message: `${ENGINES[want].name} not found.` }); return res.end(); }
-  if (body.mode === 'change') return changePlan(res, send, body);
+  if (body.mode === 'change') {
+    if (!canChange) { send('failure', { code: 'cli_error', message: `${ENGINES[engine].name} can't change a plan from the map.` }); return res.end(); }
+    return changePlan(res, send, body);
+  }
+  if (ENGINES[engine].protocol) return hermesAsk(res, send, body);
   runAgent(res, send, body)
     .then((a) => send('answer', a), (e) => { if (e !== CLOSED) send('failure', { code: failCode(e.message), message: e.message }); })
     .finally(() => res.end());
+}
+
+// ---------- asking through Hermes: the bounded NDJSON worker ----------
+const CONV_MAX = 100, CONV_IDLE = 30 * 60000, CONV_TURNS = 4;
+/** The turns of this handle, or null when it belongs to another map, graph, profile or mode. */
+function historyFor(handle, mode) {
+  const c = handle ? conversations.get(handle) : null;
+  if (!c) return null;
+  if (c.root !== root || c.digest !== graphDigest || c.profile !== profile || c.mode !== mode) return null;
+  if (Date.now() - c.at > CONV_IDLE) { conversations.delete(handle); return null; }
+  return c.turns;
+}
+function remember(handle, mode, turns) {
+  conversations.delete(handle);
+  conversations.set(handle, { root, digest: graphDigest, profile, mode, turns: turns.slice(-CONV_TURNS), at: Date.now() });
+  for (const [k, v] of conversations) if (conversations.size > CONV_MAX && Date.now() - v.at > CONV_IDLE) conversations.delete(k);
+  while (conversations.size > CONV_MAX) conversations.delete(conversations.keys().next().value);
+}
+/** Its own process group, so Stop takes the worker and every child it started. */
+function stopRequest(rec) {
+  if (rec.engine !== 'hermes') { rec.child.kill(); return; }
+  try { process.kill(-rec.child.pid, 'SIGTERM'); } catch { try { rec.child.kill(); } catch {} }
+  setTimeout(() => { try { process.kill(-rec.child.pid, 'SIGKILL'); } catch {} }, 2000).unref();
+}
+function hermesAsk(res, send, body) {
+  const mode = MODES[body.mode] || MODES.ask;
+  const question = String(body.question || '').slice(0, LIMITS.question);
+  const turns = body.session ? historyFor(String(body.session), body.mode || 'ask') : [];
+  if (body.session && !turns) {
+    send('failure', { code: 'session_expired', message: 'That conversation belongs to another map, build or profile. Ask again to start a new one.' });
+    return res.end();
+  }
+  if (!findIssues) {
+    send('failure', { code: 'plugin_missing', message: 'Source-aware Ask needs a map rebuilt with the current Floorplan skill.' });
+    return res.end();
+  }
+  const id = crypto.randomBytes(6).toString('hex');
+  const child = spawn(cli.cmd, [...cli.args, ...(profile ? ['--profile', profile] : []), 'floorplan', 'ask', '--root', root],
+    { cwd: root, env: cliEnv(), detached: true, stdio: ['pipe', 'pipe', 'pipe'], windowsHide: true });
+  const rec = { child, engine: 'hermes' };
+  running.set(id, rec);
+  send('start', { id, engine: 'hermes', profile: profile || null });
+  // the only thing logged per request: id, pid, process-group id and start time (never argv or environment)
+  console.log(`hermes ask ${id} pid=${child.pid} pgid=${child.pid} started=${new Date().toISOString()}`);
+  const inbox = [], waiters = [];
+  let outSeq = 0, buf = '', stderr = '', finished = false;
+  const push = (f) => { const w = waiters.shift(); if (w) w(f); else inbox.push(f); };
+  const nextFrame = () => (inbox.length ? Promise.resolve(inbox.shift()) : new Promise((r) => waiters.push(r)));
+  const sendFrame = (frame) => { if (!child.stdin.destroyed) child.stdin.write(JSON.stringify({ v: 1, id, seq: outSeq++, ...frame }) + '\n'); };
+  // a stopped request ends silently: no late answer, and no failure either
+  const finish = (event, data) => { if (finished) return; finished = true; clearTimeout(deadline); if (event && !rec.silent) send(event, data); res.end(); };
+  const deadline = setTimeout(() => { stopRequest(rec); finish('failure', { code: 'timeout', message: 'Hermes did not answer within 180 seconds.' }); }, LIMITS.deadlineMs);
+  deadline.unref();
+  child.stdout.on('data', (d) => {
+    buf += d;
+    if (buf.length > LIMITS.frameBytes && !buf.includes('\n')) { stopRequest(rec); finish('failure', { code: 'cli_error', message: 'The worker sent an oversized frame.' }); return; }
+    let nl;
+    while ((nl = buf.indexOf('\n')) >= 0) {
+      const line = buf.slice(0, nl); buf = buf.slice(nl + 1);
+      if (!line.trim()) continue;
+      let frame; try { frame = JSON.parse(line); } catch { finish('failure', { code: 'cli_error', message: 'The worker sent invalid JSON.' }); return; }
+      const bad = frameProblem(frame, { id, bytes: line.length });
+      if (bad) { finish('failure', { code: 'cli_error', message: `Protocol: ${bad}` }); return; }
+      push(frame);
+    }
+  });
+  child.stderr.on('data', (d) => { stderr = (stderr + d).slice(-2000); });
+  child.on('error', (e) => finish('failure', { code: 'cli_error', message: e.message }));
+  child.on('close', (code) => { running.delete(id); finish('failure', { code: 'cli_error', message: stderr.trim() || `hermes exited with code ${code}` }); });
+  res.on('close', () => { if (!finished) { finished = true; clearTimeout(deadline); running.delete(id); stopRequest(rec); } });
+  (async () => {
+    let seq = -1;
+    const take = async () => {
+      const f = await nextFrame();
+      if (f.seq <= seq) throw Object.assign(new Error('frame_out_of_order'), { code: 'cli_error' });
+      seq = f.seq;
+      return f;
+    };
+    try {
+      sendFrame({ type: 'start', done: false, mode: body.mode || 'ask', profile: profile || '', graph_digest: graphDigest,
+        instructions: mode.instructions, schema: mode.schema, question, history: (turns || []).map((t) => ({ q: t.q, a: t.a })),
+        overview: core.q.overview() });
+      const first = await take();
+      if (first.type === 'failure') { finish('failure', { code: first.code, message: first.message }); return; }
+      if (first.type !== 'ready') throw Object.assign(new Error('frame_order'), { code: 'cli_error' });
+      const boundary = new Boundary({
+        root, graph: G, blueprint: G.meta?.blueprint || null, mode: body.mode || 'ask', fingerprints,
+        query: core.q, findIssues,
+        read: async (rel, lookupId) => {
+          sendFrame({ type: 'classify_read', lookup_id: lookupId, path: rel });
+          const f = await take();
+          if (f.type === 'failure') throw Object.assign(new Error('worker_failed'), { code: f.code });
+          if (f.type !== 'source_bytes' || f.lookup_id !== lookupId) throw Object.assign(new Error('protocol_error'), { code: 'cli_error' });
+          return f.ok ? { ok: true, sha256: f.sha256, bytes_base64: f.bytes_base64 } : { ok: false, reason: f.reason };
+        },
+        ticket: async (t) => {
+          sendFrame({ type: 'source_ticket', lookup_id: t.lookupId, root_digest: t.rootDigest, mode: t.mode, path: t.path,
+            sha256: t.sha256, start: t.start, end: t.end, redact_lines: t.redactLines, byte_limit: t.byteLimit });
+          const f = await take();
+          if (f.type !== 'lookup_result' || f.lookup_id !== t.lookupId) throw Object.assign(new Error('protocol_error'), { code: 'cli_error' });
+          return { ok: !!f.ok, sha256: f.sha256, text: f.text, reason: f.reason };
+        },
+      });
+      for (;;) {
+        const f = await take();
+        if (f.type === 'lookup') {
+          const lookupId = String(f.lookup_id || '');
+          let outcome;
+          try { outcome = await boundary.lookup(f.lookup?.kind, f.lookup?.args || {}, lookupId); }
+          catch (e) { outcome = { ok: false, code: 'lookup_denied', reason: String(e.message || e) }; }
+          sendFrame({ type: 'lookup_result', lookup_id: lookupId, ...outcome });
+        } else if (f.type === 'progress') {
+          send('progress', { text: String(f.text || '').slice(0, 300) });
+        } else if (f.type === 'result') {
+          const payload = f.payload || {};
+          const problems = [...validateSchema(mode.schema, payload),
+            ...(body.mode === 'flow' ? flowProblems(payload, core.q.exists) : answerProblems(payload, core.q.exists))];
+          if (problems.length) { finish('failure', { code: 'invalid_json', message: problems.slice(0, 3).join('; ') }); return; }
+          const handle = body.session || crypto.randomBytes(8).toString('hex');
+          remember(handle, body.mode || 'ask', [...(turns || []), { q: question.slice(0, LIMITS.turnQuestion),
+            a: String(payload.answer || payload.description || '').slice(0, LIMITS.turnAnswer) }]);
+          finish('answer', { ...payload, session: handle, engine: 'hermes', profile: f.profile || profile || null,
+            provider: f.provider || null, model: f.model || null });
+          return;
+        } else if (f.type === 'failure') {
+          finish('failure', { code: f.code, message: f.message });
+          return;
+        } else {
+          throw Object.assign(new Error(`frame_order: ${f.type}`), { code: 'cli_error' });
+        }
+      }
+    } catch (e) {
+      finish('failure', { code: e.code || 'cli_error', message: String(e.message || e).slice(0, 300) });
+    }
+  })();
 }
 
 // ---------- changing a blueprint from the map ----------
@@ -597,7 +781,18 @@ const server = http.createServer((req, res) => {
       const r = changing ? { ok: false, error: 'A change is still being made.' } : undoChange();
       res.writeHead(200, { 'Content-Type': 'application/json' }); return res.end(JSON.stringify(r));
     }
-    if (req.method === 'POST' && url.pathname === '/api/cancel') { for (const c of running.values()) c.kill(); res.writeHead(204); return res.end(); }
+    if (req.method === 'POST' && url.pathname === '/api/cancel') {
+      let raw = '';
+      req.on('data', (d) => { raw += d; if (raw.length > 2000) req.destroy(); });
+      req.on('end', () => {
+        let body = {}; try { body = JSON.parse(raw); } catch {}
+        const rec = body.id && running.get(String(body.id));
+        if (rec) { rec.silent = true; stopRequest(rec); }       // just that request, and quietly
+        else for (const c of running.values()) stopRequest(c);  // other engines keep their current behaviour
+        res.writeHead(204); res.end();
+      });
+      return;
+    }
     if (req.method === 'POST' && url.pathname === '/api/export') {
       let raw = '';
       req.on('data', (d) => { raw += d; if (raw.length > 500000) req.destroy(); });
