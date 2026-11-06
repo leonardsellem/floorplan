@@ -258,6 +258,42 @@ t('a server SIGTERM stops the running Ask worker group within 5 s', () => shutdo
 // a worker can die on SIGTERM while a descendant it started ignores it: the whole group must be waited on
 t('a shutdown takes a TERM-ignoring descendant down after its worker exits', () => shutdownDuring('HANG2 with a stubborn child'));
 
+// A request can arrive while the server is draining: admission must already be closed, so no worker is left behind.
+t('an ask that arrives during the shutdown drain is refused and starts no worker', async () => {
+  const root = shop();
+  const pidsFile = path.join(root, 'pids.json');
+  const s = await serve(root, { FAKE_HERMES_PIDS: pidsFile });
+  const readPids = () => { try { return JSON.parse(fs.readFileSync(pidsFile, 'utf8')); } catch { return null; } };
+
+  const a = open(s, 'HANG until the server stops');
+  await a.waitFor('start');
+  let aPids = null;
+  for (let i = 0; i < 100 && !aPids; i++) { aPids = readPids(); if (!aPids) await new Promise((r) => setTimeout(r, 50)); }
+  assert.ok(aPids?.main.pid && aPids?.child.pid, 'the worker and its child are running');
+
+  const exited = new Promise((r) => s.server.once('exit', r));
+  const at = Date.now();
+  s.server.kill('SIGTERM');
+  await new Promise((r) => setTimeout(r, 200));
+  // a second tab asks during the drain: the listener is closed or the guard answers 503, never an admitted request
+  let refused = false;
+  try {
+    const r = await fetch(s.base + '/api/ask', {
+      method: 'POST', headers: { 'content-type': 'application/json', 'x-floorplan-token': s.token },
+      body: JSON.stringify({ question: 'HANG on the second tab' }),
+    });
+    refused = r.status === 503;
+    await r.body?.cancel();
+  } catch { refused = true; }
+  assert.ok(refused, 'an ask during the drain is refused');
+
+  await exited;
+  assert.ok(Date.now() - at < 5000, 'the server exited within 5 s');
+  assert.deepEqual(readPids(), aPids, 'the refused ask started no worker');
+  assert.ok(await waitGone(aPids, 5000), 'the pre-signal worker group is gone within 5 s');
+  assert.equal(pick(a.events, 'answer').length, 0);
+});
+
 t('a server started without --profile answers with the profile the probe reports', async () => {
   const root = shop();
   const s = await serve(root, { FLOORPLAN_PROFILE: '' });
