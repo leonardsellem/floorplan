@@ -483,11 +483,30 @@ function remember(handle, mode, turns) {
   for (const [k, v] of conversations) if (conversations.size > CONV_MAX && Date.now() - v.at > CONV_IDLE) conversations.delete(k);
   while (conversations.size > CONV_MAX) conversations.delete(conversations.keys().next().value);
 }
+/** SIGKILL that request's process group, or its own process when it has none. */
+function killRequest(rec) {
+  if (rec.child.exitCode !== null || rec.child.signalCode) return;
+  if (rec.engine !== 'hermes') { try { rec.child.kill('SIGKILL'); } catch {} return; }
+  try { process.kill(-rec.child.pid, 'SIGKILL'); } catch { try { rec.child.kill('SIGKILL'); } catch {} }
+}
 /** Its own process group, so Stop takes the worker and every child it started. */
 function stopRequest(rec) {
   if (rec.engine !== 'hermes') { rec.child.kill(); return; }
   try { process.kill(-rec.child.pid, 'SIGTERM'); } catch { try { rec.child.kill(); } catch {} }
-  setTimeout(() => { try { process.kill(-rec.child.pid, 'SIGKILL'); } catch {} }, 2000).unref();
+  setTimeout(() => killRequest(rec), 2000).unref();
+}
+let shuttingDown = false;
+/** Server shutdown is a cancellation trigger: stop every request, then exit once the workers are gone (3 s bound). */
+function shutdown() {
+  if (shuttingDown) return;
+  shuttingDown = true;
+  const recs = [...running.values()];
+  for (const rec of recs) { rec.silent = true; stopRequest(rec); }
+  if (!recs.length) return process.exit(0);
+  const hard = setTimeout(() => { for (const rec of recs) killRequest(rec); process.exit(0); }, 3000);
+  hard.unref();
+  let left = recs.length;
+  for (const rec of recs) rec.child.once('exit', () => { if (--left === 0) { clearTimeout(hard); process.exit(0); } });
 }
 function hermesAsk(res, send, body) {
   const mode = MODES[body.mode] || MODES.ask;
@@ -532,8 +551,14 @@ function hermesAsk(res, send, body) {
     }
   });
   child.stderr.on('data', (d) => { stderr = (stderr + d).slice(-2000); });
-  child.on('error', (e) => finish('failure', { code: 'cli_error', message: e.message }));
-  child.on('close', (code) => { running.delete(id); finish('failure', { code: 'cli_error', message: stderr.trim() || `hermes exited with code ${code}` }); });
+  // stderr and spawn errors can name absolute install paths: log them here, never send them to the page
+  child.on('error', (e) => { console.error(`hermes ask ${id} could not start: ${e.message}`); finish('failure', { code: 'cli_error', message: 'The ask worker could not start.' }); });
+  child.on('close', (code) => {
+    running.delete(id);
+    if (finished) return;
+    if (stderr.trim()) console.error(`hermes ask ${id} exited with code ${code}: ${stderr.trim()}`);
+    finish('failure', { code: 'cli_error', message: 'The ask worker stopped before answering.' });
+  });
   res.on('close', () => { if (!finished) { finished = true; clearTimeout(deadline); running.delete(id); stopRequest(rec); } });
   (async () => {
     let seq = -1;
@@ -848,7 +873,7 @@ server.on('listening', () => {
   } catch {}
   const forget = () => { try { if (readState()?.pid === process.pid) fs.unlinkSync(stateFile); } catch {} };
   process.on('exit', forget);
-  for (const sig of ['SIGINT', 'SIGTERM', 'SIGHUP']) process.on(sig, () => process.exit(0));
+  for (const sig of ['SIGINT', 'SIGTERM', 'SIGHUP']) process.on(sig, shutdown);
   console.log(`Floorplan: ${u}`);
   console.log(cli
     ? `asking via ${ENGINES[engine].name} ${version || ''} (${cli.path})${model ? `, model ${model}` : ''}`

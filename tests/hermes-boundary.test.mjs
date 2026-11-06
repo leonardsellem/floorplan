@@ -132,8 +132,11 @@ test('the decision schema bounds each argument; the 200-line window is enforced 
 test('the deny list refuses every class, and traversal in every form', () => {
   for (const p of ['.git/config', 'node_modules/x/index.js', '.env', '.env.local', 'AGENTS.md', 'SOUL.md',
     'CLAUDE.local.md', '.cursorrules', 'deploy/server.pem', 'id_rsa', 'credentials.json', 'service-account-x.json',
-    'src/client_secret.json', 'app-key.json', 'config/tokens.js', 'src/passwords.js', 'floorplan/serve.mjs']) {
+    'src/client_secret.json', 'app-key.json', 'config/tokens.json', 'src/passwords.yaml', 'secrets', 'floorplan/serve.mjs']) {
     assert.ok(denyReason(p), p);
+  }
+  for (const p of ['src/tokenizer.ts', 'src/tokens.css', 'src/passwordless.ts', 'config/tokens.js']) {
+    assert.equal(denyReason(p), null, p); // ordinary words, not a secret store
   }
   for (const p of ['../outside.js', '/etc/passwd', 'C:\\secret.js', 'a\\b.js', 'a\0b', '', 'a//b', './a.js']) {
     assert.equal(denyReason(p), 'invalid_path', p);

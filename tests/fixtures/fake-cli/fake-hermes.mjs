@@ -65,6 +65,11 @@ function handle(frame) {
     if (frame.profile !== activeProfile) { send({ type: 'failure', code: 'profile_mismatch', message: 'profile_mismatch' }); return; }
     const q = String(frame.question || '');
     if (q.startsWith('FAIL:')) { send({ type: 'failure', code: q.slice(5).split(' ')[0], message: 'scripted failure' }); return; }
+    if (q.startsWith('CRASH')) {
+      // a Python traceback names an absolute install path: the server must log it, never forward it
+      process.stderr.write('Traceback (most recent call last):\n  File "/opt/hermes-install/plugin/hermes/runner.py", line 1, in <module>\nSystemExit\n');
+      process.exit(1);
+    }
     if (q.startsWith('HANG')) { hang(); return; }
     send({ type: 'ready', profile: activeProfile, plugin: 'floorplan', protocol: 1 });
     if (q.startsWith('SLOW')) {

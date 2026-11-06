@@ -447,7 +447,7 @@ def _extract(buf: bytes, frame: dict) -> dict:
     if "\0" in text:
         return {"ok": False, "code": "lookup_denied", "reason": "binary"}
     lines = text.split("\n")
-    redact = frame.get("redact_lines") or []
+    redact = frame.get("redact_lines")
     if not isinstance(redact, list) or any(not isinstance(n, int) or n < 1 or n > len(lines) for n in redact):
         return {"ok": False, "code": "lookup_denied", "reason": "changed"}
     start, end = frame.get("start"), frame.get("end")

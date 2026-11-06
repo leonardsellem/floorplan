@@ -99,6 +99,18 @@ const ask = async (s, question, session) => {
   return Promise.race([o.done, new Promise((_, reject) => setTimeout(() => reject(new Error(`ask timed out: ${question}`)), 20000))]);
 };
 const pick = (events, name) => events.filter((e) => e.event === name).map((e) => e.data);
+const gone = (p) => {
+  try { process.kill(p.pid, 0); } catch { return true; }
+  try { return fs.readFileSync(`/proc/${p.pid}/stat`, 'utf8').split(' ')[21] !== String(p.start); } catch { return true; }
+};
+const waitGone = async (pids, ms) => {
+  const until = Date.now() + ms;
+  while (Date.now() < until) {
+    if (gone(pids.main) && gone(pids.child)) return true;
+    await new Promise((r) => setTimeout(r, 50));
+  }
+  return false;
+};
 
 t('a source-only fact reaches the answer, and the page names Hermes, the profile and the provider', async () => {
   const root = shop({ 'shop-api/canary.js': `export const CANARY_FACT = '${CANARY}';\n` });
@@ -191,13 +203,7 @@ t('Stop kills that request’s process group, and another request keeps running'
   assert.ok(pick(b, 'answer').length, 'the other request answered while A hung');
 
   await a.cancel();
-  const gone = (p) => {
-    try { process.kill(p.pid, 0); } catch { return true; }
-    try { return fs.readFileSync(`/proc/${p.pid}/stat`, 'utf8').split(' ')[21] !== String(p.start); } catch { return true; }
-  };
-  let dead = false;
-  for (let i = 0; i < 100 && !dead; i++) { dead = gone(pids.main) && gone(pids.child); if (!dead) await new Promise((r) => setTimeout(r, 50)); }
-  assert.ok(dead, 'the whole group is gone within 5 s');
+  assert.ok(await waitGone(pids, 5000), 'the whole group is gone within 5 s');
   assert.equal(pick(a.events, 'answer').length, 0);
 });
 
@@ -226,6 +232,27 @@ t('a Stop with no id, or with an id this server never issued, stops nothing', as
   assert.ok(started.id, 'the request kept its own id');
 });
 
+t('a server SIGTERM stops the running Ask worker group within 5 s', async () => {
+  const root = shop();
+  const pidsFile = path.join(root, 'pids.json');
+  const s = await serve(root, { FAKE_HERMES_PIDS: pidsFile });
+
+  const a = open(s, 'HANG until the server stops');
+  await a.waitFor('start');
+  let pids = null;
+  for (let i = 0; i < 100 && !pids; i++) { try { pids = JSON.parse(fs.readFileSync(pidsFile, 'utf8')); } catch { await new Promise((r) => setTimeout(r, 50)); } }
+  assert.ok(pids?.main.pid && pids?.child.pid, 'the worker and its child are running');
+
+  // `serve.mjs --stop` sends the server SIGTERM; Ctrl-C and a closed terminal deliver SIGINT/SIGHUP
+  const exited = new Promise((r) => s.server.once('exit', r));
+  const at = Date.now();
+  s.server.kill('SIGTERM');
+  assert.ok(await waitGone(pids, 5000), 'the worker and its child are gone within 5 s');
+  await exited;
+  assert.ok(Date.now() - at < 5000, 'the server exited within 5 s');
+  assert.equal(pick(a.events, 'answer').length, 0);
+});
+
 t('a server started without --profile answers with the profile the probe reports', async () => {
   const root = shop();
   const s = await serve(root, { FLOORPLAN_PROFILE: '' });
@@ -236,6 +263,17 @@ t('a server started without --profile answers with the profile the probe reports
   assert.ok(pick(events, 'answer').length, 'the documented no-flag start answers');
   assert.equal(pick(events, 'failure').length, 0);
   assert.equal(pick(events, 'answer')[0].profile, 'default-profile');
+});
+
+t('a crashed worker fails with a fixed message, never its stderr', async () => {
+  const root = shop();
+  const s = await serve(root);
+  const events = await ask(s, 'CRASH on this one');
+  const [failure] = pick(events, 'failure');
+  assert.equal(failure?.code, 'cli_error');
+  assert.equal(failure?.message, 'The ask worker stopped before answering.');
+  assert.ok(!JSON.stringify(events).includes('/opt/hermes-install'), 'the traceback stayed in the server log');
+  assert.equal(pick(events, 'answer').length, 0);
 });
 
 t('a result that arrives after Stop never renders', async () => {

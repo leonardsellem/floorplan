@@ -158,7 +158,7 @@ const DENY_DIR = new Set(['.git', '.hg', '.svn', '.hermes', '.ssh', '.aws', '.gn
   'build', 'out', 'target', 'coverage', '.next', '.nuxt', '.svelte-kit', '.turbo']);
 const DENY_FILE = /^(AGENTS|SOUL|CLAUDE[^/]*)\.md$|^\.cursorrules$|^\.env/i;
 const CREDENTIAL = /\.(pem|key|p12|pfx|jks|keystore)$|^id_(rsa|dsa|ecdsa|ed25519)$|^service[-_]?account.*\.json$|^credentials?\.json$|^firebase-adminsdk.*\.json$|^client_secret.*\.json$|-key\.json$/i;
-const SECRET_STORE = /token|secret|password/i;
+const SECRET_STORE = /^\.?(tokens?|secrets?|passwords?)(\.(json|ya?ml|txt|env|ini|conf|cfg))?$/i;
 
 /** Why `rel` may never be read, or null when it may. Blueprint mode opens exactly three extra inputs. */
 export function denyReason(rel, { blueprint = null, prdPath = null } = {}) {

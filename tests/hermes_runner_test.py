@@ -339,6 +339,18 @@ class AskTest(unittest.TestCase):
         replay_denials = [f for f in out if f.get("code") == "lookup_denied" and f.get("reason") == "unknown_ticket"]
         self.assertEqual(len(replay_denials), 1)
 
+    def test_a_ticket_without_redact_lines_is_refused_and_returns_no_text(self):
+        self.write("a.js", "one\ntwo")
+        scripted = self.frames("a.js")
+        del scripted[1]["redact_lines"]  # a Node-side rename drops the key; redaction must not fail open
+        scripted[2] = {"v": 1, "id": "req1", "type": "lookup_result", "seq": 3, "lookup_id": "req1-0",
+                       "ok": False, "code": "lookup_denied", "reason": "changed"}
+        code, out, llm = self.run_ask([start(), *scripted], [READ, FINAL])
+        self.assertEqual((out[3]["ok"], out[3]["code"], out[3]["reason"]),
+                         (False, "lookup_denied", "changed"))
+        self.assertNotIn("text", out[3])
+        self.assertNotIn("one\ntwo", llm.calls[1]["text"])
+
     def test_each_provider_error_maps_to_one_typed_failure(self):
         cases = [(PluginLlmTrustError("nope"), "model_override_denied"),
                  (RuntimeError("401 Unauthorized"), "not_logged_in"),
