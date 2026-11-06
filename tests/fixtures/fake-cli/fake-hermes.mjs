@@ -43,17 +43,24 @@ function answerPayload() {
   };
 }
 
-function hang() {
-  const child = spawn(process.execPath, ['-e', 'setInterval(() => {}, 1000)'], { stdio: 'ignore' });
+function hang({ termIgnoringChild = false } = {}) {
+  const ready = path.join(root, 'child-ready');
+  // the stubborn child arms itself and says so: the pids below are only published once it cannot miss SIGTERM
+  const code = termIgnoringChild
+    ? `process.on('SIGTERM',()=>{});require('node:fs').writeFileSync(${JSON.stringify(ready)},'1');setInterval(() => {}, 1000)`
+    : 'setInterval(() => {}, 1000)';
+  const child = spawn(process.execPath, ['-e', code], { stdio: 'ignore' });
   const stat = (pid) => {
     try {
       const fields = fs.readFileSync(`/proc/${pid}/stat`, 'utf8').split(' ');
       return { pid, start: fields[21] };
     } catch { return { pid, start: null }; }
   };
-  fs.writeFileSync(process.env.FAKE_HERMES_PIDS || path.join(root, 'pids.json'),
+  const publish = () => fs.writeFileSync(process.env.FAKE_HERMES_PIDS || path.join(root, 'pids.json'),
     JSON.stringify({ main: stat(process.pid), child: stat(child.pid) }));
-  process.on('SIGTERM', () => {}); // only the group SIGKILL, 2 s later, ends this
+  if (!termIgnoringChild) publish();
+  else { const wait = setInterval(() => { if (fs.existsSync(ready)) { clearInterval(wait); publish(); } }, 10); }
+  if (!termIgnoringChild) process.on('SIGTERM', () => {}); // only the group SIGKILL, 2 s later, ends this
 }
 
 function handle(frame) {
@@ -70,6 +77,7 @@ function handle(frame) {
       process.stderr.write('Traceback (most recent call last):\n  File "/opt/hermes-install/plugin/hermes/runner.py", line 1, in <module>\nSystemExit\n');
       process.exit(1);
     }
+    if (q.startsWith('HANG2')) { hang({ termIgnoringChild: true }); return; }
     if (q.startsWith('HANG')) { hang(); return; }
     send({ type: 'ready', profile: activeProfile, plugin: 'floorplan', protocol: 1 });
     if (q.startsWith('SLOW')) {

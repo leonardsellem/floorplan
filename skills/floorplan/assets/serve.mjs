@@ -485,8 +485,8 @@ function remember(handle, mode, turns) {
 }
 /** SIGKILL that request's process group, or its own process when it has none. */
 function killRequest(rec) {
-  if (rec.child.exitCode !== null || rec.child.signalCode) return;
-  if (rec.engine !== 'hermes') { try { rec.child.kill('SIGKILL'); } catch {} return; }
+  if (rec.engine !== 'hermes') { if (rec.child.exitCode !== null || rec.child.signalCode) return; try { rec.child.kill('SIGKILL'); } catch {} return; }
+  // the group can outlive the worker that led it, so never skip on the leader's exit
   try { process.kill(-rec.child.pid, 'SIGKILL'); } catch { try { rec.child.kill('SIGKILL'); } catch {} }
 }
 /** Its own process group, so Stop takes the worker and every child it started. */
@@ -496,17 +496,26 @@ function stopRequest(rec) {
   setTimeout(() => killRequest(rec), 2000).unref();
 }
 let shuttingDown = false;
-/** Server shutdown is a cancellation trigger: stop every request, then exit once the workers are gone (3 s bound). */
+/** True while any process of that request remains: its own group for Hermes, the child otherwise. */
+function groupAlive(rec) {
+  if (rec.engine !== 'hermes') return rec.child.exitCode === null && !rec.child.signalCode;
+  try { process.kill(-rec.child.pid, 0); return true; } catch { return false; }
+}
+/** Server shutdown is a cancellation trigger: stop every request, then exit once its whole group is gone (3 s bound). */
 function shutdown() {
   if (shuttingDown) return;
   shuttingDown = true;
   const recs = [...running.values()];
   for (const rec of recs) { rec.silent = true; stopRequest(rec); }
   if (!recs.length) return process.exit(0);
-  const hard = setTimeout(() => { for (const rec of recs) killRequest(rec); process.exit(0); }, 3000);
-  hard.unref();
-  let left = recs.length;
-  for (const rec of recs) rec.child.once('exit', () => { if (--left === 0) { clearTimeout(hard); process.exit(0); } });
+  const deadline = Date.now() + 3000;
+  // a descendant can outlive the worker that started it: wait on the group, not only on the group leader
+  const poll = () => {
+    if (!recs.every((rec) => !groupAlive(rec)) && Date.now() < deadline) return void setTimeout(poll, 50);
+    for (const rec of recs) killRequest(rec);
+    process.exit(0);
+  };
+  poll();
 }
 function hermesAsk(res, send, body) {
   const mode = MODES[body.mode] || MODES.ask;

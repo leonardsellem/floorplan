@@ -232,12 +232,12 @@ t('a Stop with no id, or with an id this server never issued, stops nothing', as
   assert.ok(started.id, 'the request kept its own id');
 });
 
-t('a server SIGTERM stops the running Ask worker group within 5 s', async () => {
+const shutdownDuring = async (question) => {
   const root = shop();
   const pidsFile = path.join(root, 'pids.json');
   const s = await serve(root, { FAKE_HERMES_PIDS: pidsFile });
 
-  const a = open(s, 'HANG until the server stops');
+  const a = open(s, question);
   await a.waitFor('start');
   let pids = null;
   for (let i = 0; i < 100 && !pids; i++) { try { pids = JSON.parse(fs.readFileSync(pidsFile, 'utf8')); } catch { await new Promise((r) => setTimeout(r, 50)); } }
@@ -251,7 +251,12 @@ t('a server SIGTERM stops the running Ask worker group within 5 s', async () => 
   await exited;
   assert.ok(Date.now() - at < 5000, 'the server exited within 5 s');
   assert.equal(pick(a.events, 'answer').length, 0);
-});
+};
+
+t('a server SIGTERM stops the running Ask worker group within 5 s', () => shutdownDuring('HANG until the server stops'));
+
+// a worker can die on SIGTERM while a descendant it started ignores it: the whole group must be waited on
+t('a shutdown takes a TERM-ignoring descendant down after its worker exits', () => shutdownDuring('HANG2 with a stubborn child'));
 
 t('a server started without --profile answers with the profile the probe reports', async () => {
   const root = shop();
