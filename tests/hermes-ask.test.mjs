@@ -12,6 +12,8 @@ import { FAILURE_CODES } from '../skills/floorplan/assets/hermes-boundary.mjs';
 
 const FAKE = path.join(REPO, 'tests', 'fixtures', 'fake-cli', 'fake-hermes.mjs');
 const FAKE_CLAUDE = path.join(REPO, 'tests', 'fixtures', 'fake-cli', 'fake-claude.mjs');
+// Windows-native Hermes Ask is LS-3921 (unsupported): process-group Stop does not exist there.
+const t = process.platform === 'win32' ? test.skip : test;
 const roots = [];
 const servers = [];
 const CANARY = 'refunds settle in three days';
@@ -98,7 +100,7 @@ const ask = async (s, question, session) => {
 };
 const pick = (events, name) => events.filter((e) => e.event === name).map((e) => e.data);
 
-test('a source-only fact reaches the answer, and the page names Hermes, the profile and the provider', async () => {
+t('a source-only fact reaches the answer, and the page names Hermes, the profile and the provider', async () => {
   const root = shop({ 'shop-api/canary.js': `export const CANARY_FACT = '${CANARY}';\n` });
   const s = await serve(root, { FAKE_HERMES_READ: 'shop-api/canary.js' });
   assert.equal(s.page.engine, 'hermes');
@@ -119,7 +121,7 @@ test('a source-only fact reaches the answer, and the page names Hermes, the prof
   assert.ok(answer.items.some((i) => i.id === 'f:shop-api/canary.js'));
 });
 
-test('the worker is never handed personal, instruction or outside-root context', async () => {
+t('the worker is never handed personal, instruction or outside-root context', async () => {
   const root = shop({
     'AGENTS.md': 'AGENTS_CANARY: never send this\n',
     'SOUL.md': 'SOUL_CANARY: never send this\n',
@@ -142,7 +144,7 @@ test('the worker is never handed personal, instruction or outside-root context',
   assert.equal(s.calls().filter((f) => f.type === 'classify_read').length, 1);
 });
 
-test('two maps and two profiles never share a conversation handle', async () => {
+t('two maps and two profiles never share a conversation handle', async () => {
   const rootA = shop();
   const rootB = shop();
   const a = await serve(rootA, { FLOORPLAN_PROFILE: 'profile-a' });
@@ -160,7 +162,7 @@ test('two maps and two profiles never share a conversation handle', async () => 
   }
 });
 
-test('a rebuild resets follow-ups, and the page says so', async () => {
+t('a rebuild resets follow-ups, and the page says so', async () => {
   const root = shop();
   const s = await serve(root);
   const [first] = pick(await ask(s, 'What is this?'), 'answer');
@@ -173,7 +175,7 @@ test('a rebuild resets follow-ups, and the page says so', async () => {
   assert.equal(failure?.code, 'session_expired');
 });
 
-test('Stop kills that request’s process group, and another request keeps running', async () => {
+t('Stop kills that request’s process group, and another request keeps running', async () => {
   const root = shop();
   const pidsFile = path.join(root, 'pids.json');
   const s = await serve(root, { FAKE_HERMES_PIDS: pidsFile });
@@ -199,7 +201,7 @@ test('Stop kills that request’s process group, and another request keeps runni
   assert.equal(pick(a.events, 'answer').length, 0);
 });
 
-test('a result that arrives after Stop never renders', async () => {
+t('a result that arrives after Stop never renders', async () => {
   const root = shop();
   const s = await serve(root);
   const a = open(s, 'SLOW answer, then a late result');
@@ -210,7 +212,7 @@ test('a result that arrives after Stop never renders', async () => {
   assert.equal(pick(a.events, 'failure').length, 0, 'no failure either: the tab stopped');
 });
 
-test('each failure code reaches the page as a typed failure with no answer', async () => {
+t('each failure code reaches the page as a typed failure with no answer', async () => {
   const root = shop();
   const s = await serve(root);
   for (const code of ['rate_limited', 'not_logged_in', 'model_override_denied', 'profile_mismatch', 'cli_error']) {
@@ -220,7 +222,7 @@ test('each failure code reaches the page as a typed failure with no answer', asy
   }
 });
 
-test('Hermes missing is cli_missing, never Claude or Codex', async () => {
+t('Hermes missing is cli_missing, never Claude or Codex', async () => {
   const root = shop();
   const s = await serve(root, { FLOORPLAN_HERMES: path.join(root, 'no-such-hermes'), FLOORPLAN_CLAUDE: FAKE_CLAUDE, FLOORPLAN_CODEX: path.join(root, 'no-such-codex') });
   assert.equal(s.page.cli, false);
@@ -231,7 +233,7 @@ test('Hermes missing is cli_missing, never Claude or Codex', async () => {
   assert.equal(pick(events, 'answer').length, 0);
 });
 
-test('the page has copy for every typed failure code', () => {
+t('the page has copy for every typed failure code', () => {
   const viewer = fs.readFileSync(path.join(SKILL, 'assets', 'viewer.html'), 'utf8');
   const block = /const FAILURE_COPY = \{([\s\S]*?)\n\};/.exec(viewer)[1];
   const codes = [...block.matchAll(/^[ ]{2}([a-z_]+):/gm)].map((m) => m[1]).sort();
