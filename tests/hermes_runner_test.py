@@ -108,6 +108,19 @@ class PluginTest(unittest.TestCase):
         self.assertEqual([k for k in payload if any(word in k.lower() for word in forbidden)], [])
         self.assertEqual([k for k in payload["python"] if any(word in k.lower() for word in forbidden)], [])
 
+    def test_the_probe_reports_unsupported_outside_posix(self):
+        # One gate for the probe and the ask worker: posix, O_NOFOLLOW, and a dir_fd-capable os.open.
+        self.assertEqual(self.runner.SUPPORTED, os.name == "posix" and hasattr(os, "O_NOFOLLOW")
+                         and os.open in os.supports_dir_fd)
+        original = self.runner.SUPPORTED
+        self.runner.SUPPORTED = False
+        try:
+            payload = self.runner.probe_payload(profile="throwaway-profile", plugin_version="9.9.9-test",
+                                                skill_path=REPO / "skills" / "floorplan" / "SKILL.md")
+        finally:
+            self.runner.SUPPORTED = original
+        self.assertEqual(payload["ask"], "unsupported_runtime")
+
     def test_ask_takes_a_root_option_and_serves_the_worker(self):
         parser = argparse.ArgumentParser(prog="hermes floorplan")
         self.ctx.cli_commands[0]["setup_fn"](parser)
