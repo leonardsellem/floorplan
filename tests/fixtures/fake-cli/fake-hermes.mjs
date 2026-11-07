@@ -28,7 +28,35 @@ const readPath = process.env.FAKE_HERMES_READ || '';
 let id = '';
 let seq = 0;
 let fact = '';
+let mode = 'ask';
+const changeState = { reply: null, reads: [], sent: 0, waiting: false };
 const send = (frame) => process.stdout.write(JSON.stringify({ v: 1, id, seq: seq++, ...frame }) + '\n');
+
+/** The next scripted Change reply, shared across the attempts of one test through a counter file. */
+function nextChangeReply() {
+  const file = process.env.FAKE_HERMES_CHANGES;
+  if (!file) return { payload: {} };
+  let list = [];
+  try { list = JSON.parse(fs.readFileSync(file, 'utf8')); } catch { list = []; }
+  const usedFile = `${file}.used`;
+  let used = 0;
+  try { used = Number(fs.readFileSync(usedFile, 'utf8')) || 0; } catch {}
+  fs.writeFileSync(usedFile, String(used + 1));
+  const reply = list[used] ?? { payload: {} };
+  return reply && reply.payload ? reply : { payload: reply };
+}
+
+/** A Change drives its own reads first, then returns the scripted plan and architecture. */
+function pumpChange() {
+  if (changeState.sent < changeState.reads.length) {
+    const path = changeState.reads[changeState.sent++];
+    changeState.waiting = true;
+    send({ type: 'lookup', lookup_id: `${id}-${changeState.sent - 1}`, lookup: { kind: 'read', args: { path, start: 1, end: 200 } } });
+    return;
+  }
+  const { reads, ...payload } = changeState.reply.payload || {};
+  send({ type: 'result', payload, provider: 'fake-provider', model: 'fake-model-1' });
+}
 
 function answerPayload() {
   const graph = JSON.parse(fs.readFileSync(path.join(root, 'floorplan', 'graph.json'), 'utf8'));
@@ -68,6 +96,7 @@ function handle(frame) {
   if (frame.type === 'start') {
     id = frame.id;
     seq = 0;
+    mode = frame.mode || 'ask';
     // the real runner refuses any start frame whose profile is not the CLI's own (runner.py:279)
     if (frame.profile !== activeProfile) { send({ type: 'failure', code: 'profile_mismatch', message: 'profile_mismatch' }); return; }
     const q = String(frame.question || '');
@@ -80,6 +109,14 @@ function handle(frame) {
     if (q.startsWith('HANG2')) { hang({ termIgnoringChild: true }); return; }
     if (q.startsWith('HANG')) { hang(); return; }
     send({ type: 'ready', profile: activeProfile, plugin: 'floorplan', protocol: 1 });
+    if (mode === 'change') {
+      changeState.reply = nextChangeReply();
+      changeState.reads = Array.isArray(changeState.reply.payload?.reads) ? changeState.reply.payload.reads.map(String) : [];
+      changeState.sent = 0;
+      changeState.waiting = false;
+      pumpChange();
+      return;
+    }
     if (q.startsWith('SLOW')) {
       // a result after the tab has already stopped: the server must drop it
       setTimeout(() => send({ type: 'result', payload: answerPayload(), provider: 'fake-provider', model: 'fake-model-1' }), 1500);
@@ -87,6 +124,21 @@ function handle(frame) {
     }
     if (readPath) send({ type: 'lookup', lookup_id: `${id}-0`, lookup: { kind: 'read', args: { path: readPath, start: 1, end: 40 } } });
     else send({ type: 'result', payload: answerPayload(), provider: 'fake-provider', model: 'fake-model-1' });
+    return;
+  }
+  if (frame.type === 'source_ticket') {
+    const buf = fs.readFileSync(path.join(root, frame.path));
+    const lines = buf.toString('utf8').split('\n');
+    for (const n of frame.redact_lines || []) lines[n - 1] = '[redacted: known secret]';
+    const text = lines.slice(frame.start - 1, frame.end).join('\n');
+    const line = text.split('\n').find((l) => l.includes('CANARY_FACT'));
+    fact = line ? line.replace(/^.*CANARY_FACT[^=]*=\s*/, '').replace(/[;"',]+$/, '').trim() : '';
+    send({ type: 'lookup_result', lookup_id: frame.lookup_id, ok: true, sha256: sha256(buf), text });
+    if (mode !== 'change') send({ type: 'result', payload: answerPayload(), provider: 'fake-provider', model: 'fake-model-1' });
+    return;
+  }
+  if (frame.type === 'lookup_result') {
+    if (mode === 'change') { changeState.waiting = false; pumpChange(); }
     return;
   }
   if (frame.type === 'classify_read') {
@@ -98,16 +150,6 @@ function handle(frame) {
     send({ type: 'source_bytes', lookup_id: frame.lookup_id, path: frame.path, ok: true,
       sha256: sha256(buf), bytes_base64: buf.toString('base64') });
     return;
-  }
-  if (frame.type === 'source_ticket') {
-    const buf = fs.readFileSync(path.join(root, frame.path));
-    const lines = buf.toString('utf8').split('\n');
-    for (const n of frame.redact_lines || []) lines[n - 1] = '[redacted: known secret]';
-    const text = lines.slice(frame.start - 1, frame.end).join('\n');
-    const line = text.split('\n').find((l) => l.includes('CANARY_FACT'));
-    fact = line ? line.replace(/^.*CANARY_FACT[^=]*=\s*/, '').replace(/[;"',]+$/, '').trim() : '';
-    send({ type: 'lookup_result', lookup_id: frame.lookup_id, ok: true, sha256: sha256(buf), text });
-    send({ type: 'result', payload: answerPayload(), provider: 'fake-provider', model: 'fake-model-1' });
   }
 }
 

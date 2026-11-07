@@ -174,7 +174,7 @@ const ENGINES = {
     run: codexRun,
   },
   hermes: {
-    name: 'Hermes', site: 'https://hermes-agent.nousresearch.com/docs', structured: true, protocol: true, change: false,
+    name: 'Hermes', site: 'https://hermes-agent.nousresearch.com/docs', structured: true, protocol: true,
     find: () => {
       const bin = resolveCli(given('hermes') || [...which('hermes'), path.join(HOME, '.local', 'bin', 'hermes')], []);
       const info = bin && hermesProbe(bin);
@@ -243,7 +243,7 @@ function load() {
   MODES = {
     ask: { instructions: core.floorplanAskInstructions(G, said), schema: core.FLOORPLAN_ANSWER_SCHEMA, file: path.join(here, '.cache', 'answer-schema.json') },
     flow: { instructions: core.floorplanFlowInstructions(G, said), schema: core.FLOORPLAN_FLOW_SCHEMA, file: path.join(here, '.cache', 'flow-schema.json') },
-    ...(G.meta?.blueprint && canChange ? { change: { instructions: core.floorplanChangeInstructions(G), schema: core.FLOORPLAN_CHANGE_SCHEMA, file: path.join(here, '.cache', 'change-schema.json') } } : {}),
+    ...(G.meta?.blueprint && canChange ? { change: { instructions: core.floorplanChangeInstructions(G, said), schema: core.FLOORPLAN_CHANGE_SCHEMA, file: path.join(here, '.cache', 'change-schema.json') } } : {}),
   };
   if (ENGINES[engine]?.schemaFile) {
     fs.mkdirSync(path.join(here, '.cache'), { recursive: true });
@@ -263,8 +263,13 @@ const tabs = new Set();
 let lastTab = Date.now();
 const broadcast = (event, data = {}) => { for (const t of tabs) t.write(`event: ${event}\ndata: ${JSON.stringify(data)}\n\n`); };
 let reloadTimer = null;
+// index.html mtimes this server wrote itself: a pending change publishes and rolls back under its own
+// explicit reload, so the watcher never adds a second one (and never one at all on a conflict).
+const selfIndexWrites = new Set();
+const addSelfIndexWrite = () => { try { selfIndexWrites.add(fs.statSync(path.join(here, 'index.html')).mtimeMs); } catch {} };
 fs.watchFile(path.join(here, 'index.html'), { interval: 1000 }, (cur, prev) => {
   if (cur.mtimeMs === prev.mtimeMs) return;
+  if (selfIndexWrites.delete(cur.mtimeMs)) return;
   // build writes several files; wait for it to finish, and keep serving the old map if the new one is half-written
   clearTimeout(reloadTimer);
   reloadTimer = setTimeout(() => { try { load(); broadcast('reload'); console.log('map rebuilt: reloaded open tabs'); } catch {} }, 800);
@@ -412,6 +417,7 @@ function codexRun(body, mode) {
   };
 }
 const CLOSED = Symbol('closed'); // the browser went away mid-request
+const CANCELLED = Symbol('cancelled'); // a staged validator child was stopped
 /** Runs the agent once for a request and resolves with its answer, streaming progress through `send`. */
 function runAgent(res, send, body) {
   return new Promise((resolve, reject) => {
@@ -483,14 +489,19 @@ function remember(handle, mode, turns) {
   for (const [k, v] of conversations) if (conversations.size > CONV_MAX && Date.now() - v.at > CONV_IDLE) conversations.delete(k);
   while (conversations.size > CONV_MAX) conversations.delete(conversations.keys().next().value);
 }
-/** SIGKILL that request's process group, or its own process when it has none. */
+/** SIGKILL that request's process group, its staged validator children, or its own process. */
 function killRequest(rec) {
+  for (const c of rec.children || []) { try { process.kill(-c.pid, 'SIGKILL'); } catch { try { c.kill('SIGKILL'); } catch {} } }
   if (rec.engine !== 'hermes') { if (rec.child.exitCode !== null || rec.child.signalCode) return; try { rec.child.kill('SIGKILL'); } catch {} return; }
   // the group can outlive the worker that led it, so never skip on the leader's exit
   try { process.kill(-rec.child.pid, 'SIGKILL'); } catch { try { rec.child.kill('SIGKILL'); } catch {} }
 }
 /** Its own process group, so Stop takes the worker and every child it started. */
 function stopRequest(rec) {
+  // once publication began, a Stop is not permission to interrupt preservation halfway through
+  if (rec.publishing) return;
+  rec.cancelled = true;
+  for (const c of rec.children || []) { try { process.kill(-c.pid, 'SIGTERM'); } catch { try { c.kill('SIGTERM'); } catch {} } }
   if (rec.engine !== 'hermes') { rec.child.kill(); return; }
   try { process.kill(-rec.child.pid, 'SIGTERM'); } catch { try { rec.child.kill(); } catch {} }
   setTimeout(() => killRequest(rec), 2000).unref();
@@ -498,6 +509,7 @@ function stopRequest(rec) {
 let shuttingDown = false;
 /** True while any process of that request remains: its own group for Hermes, the child otherwise. */
 function groupAlive(rec) {
+  for (const c of rec.children || []) { if (c.exitCode === null && !c.signalCode) return true; }
   if (rec.engine !== 'hermes') return rec.child.exitCode === null && !rec.child.signalCode;
   try { process.kill(-rec.child.pid, 0); return true; } catch { return false; }
 }
@@ -517,8 +529,110 @@ function shutdown() {
   };
   poll();
 }
+/**
+ * One Hermes worker run: spawn the private protocol, answer its lookups through the read boundary,
+ * and resolve with the final payload. Rejects with a typed error, or CLOSED when the tab or the
+ * request stopped it. `rec` is the request record Stop and shutdown kill.
+ */
+function hermesRun(res, send, body, { mode, question, instructions, schema, rec, history = [], deadlineMs = LIMITS.deadlineMs }) {
+  return new Promise((resolve, reject) => {
+    const child = spawn(cli.cmd, [...cli.args, ...(profile ? ['--profile', profile] : []), 'floorplan', 'ask', '--root', root],
+      { cwd: root, env: cliEnv(), detached: true, stdio: ['pipe', 'pipe', 'pipe'], windowsHide: true });
+    rec.child = child;
+    send('start', { id: rec.id, engine: 'hermes', profile: profile || null });
+    // the only thing logged per request: id, pid, process-group id and start time (never argv or environment)
+    console.log(`hermes ${mode} ${rec.id} pid=${child.pid} pgid=${child.pid} started=${new Date().toISOString()}`);
+    const inbox = [], waiters = [];
+    let outSeq = 0, buf = '', stderr = '', settled = false;
+    const settle = (fn, value) => { if (settled) return; settled = true; clearTimeout(deadline); fn(value); };
+    const push = (f) => { const w = waiters.shift(); if (w) w(f); else inbox.push(f); };
+    const nextFrame = () => (inbox.length ? Promise.resolve(inbox.shift()) : new Promise((r) => waiters.push(r)));
+    const sendFrame = (frame) => { if (!child.stdin.destroyed) child.stdin.write(JSON.stringify({ v: 1, id: rec.id, seq: outSeq++, ...frame }) + '\n'); };
+    const deadline = setTimeout(() => { stopRequest(rec); settle(reject, Object.assign(new Error('Hermes did not answer in time.'), { code: 'timeout' })); }, deadlineMs);
+    deadline.unref();
+    child.stdout.on('data', (d) => {
+      buf += d;
+      if (buf.length > LIMITS.frameBytes && !buf.includes('\n')) { stopRequest(rec); settle(reject, Object.assign(new Error('The worker sent an oversized frame.'), { code: 'cli_error' })); return; }
+      let nl;
+      while ((nl = buf.indexOf('\n')) >= 0) {
+        const line = buf.slice(0, nl); buf = buf.slice(nl + 1);
+        if (!line.trim()) continue;
+        let frame; try { frame = JSON.parse(line); } catch { stopRequest(rec); settle(reject, Object.assign(new Error('The worker sent invalid JSON.'), { code: 'cli_error' })); return; }
+        const bad = frameProblem(frame, { id: rec.id, bytes: line.length });
+        if (bad) { stopRequest(rec); settle(reject, Object.assign(new Error(`Protocol: ${bad}`), { code: 'cli_error' })); return; }
+        push(frame);
+      }
+    });
+    child.stderr.on('data', (d) => { stderr = (stderr + d).slice(-2000); });
+    // stderr and spawn errors can name absolute install paths: log them here, never send them to the page
+    child.on('error', (e) => { console.error(`hermes ${mode} ${rec.id} could not start: ${e.message}`); settle(reject, Object.assign(new Error('The ask worker could not start.'), { code: 'cli_error' })); });
+    child.on('close', (code) => {
+      if (settled) return;
+      if (rec.cancelled || rec.silent) return settle(reject, CLOSED);
+      if (stderr.trim()) console.error(`hermes ${mode} ${rec.id} exited with code ${code}: ${stderr.trim()}`);
+      settle(reject, Object.assign(new Error('The ask worker stopped before answering.'), { code: 'cli_error' }));
+    });
+    res.on('close', () => { if (!settled && !rec.publishing) { rec.silent = true; stopRequest(rec); settle(reject, CLOSED); } });
+    (async () => {
+      let seq = -1;
+      const take = async () => {
+        const f = await nextFrame();
+        if (f.seq <= seq) throw Object.assign(new Error('frame_out_of_order'), { code: 'cli_error' });
+        seq = f.seq;
+        return f;
+      };
+      try {
+        sendFrame({ type: 'start', done: false, mode, profile: profile || '', graph_digest: graphDigest,
+          instructions, schema, question, history, overview: core.q.overview() });
+        const first = await take();
+        if (first.type === 'failure') throw Object.assign(new Error(String(first.message || first.code)), { code: first.code });
+        if (first.type !== 'ready') throw Object.assign(new Error('frame_order'), { code: 'cli_error' });
+        const boundary = new Boundary({
+          root, graph: G, blueprint: G.meta?.blueprint || null, mode, fingerprints,
+          query: core.q, findIssues,
+          read: async (rel, lookupId) => {
+            sendFrame({ type: 'classify_read', lookup_id: lookupId, path: rel });
+            const f = await take();
+            if (f.type === 'failure') throw Object.assign(new Error('worker_failed'), { code: f.code });
+            if (f.type !== 'source_bytes' || f.lookup_id !== lookupId) throw Object.assign(new Error('protocol_error'), { code: 'cli_error' });
+            return f.ok ? { ok: true, sha256: f.sha256, bytes_base64: f.bytes_base64 } : { ok: false, reason: f.reason };
+          },
+          ticket: async (t) => {
+            sendFrame({ type: 'source_ticket', lookup_id: t.lookupId, root_digest: t.rootDigest, mode: t.mode, path: t.path,
+              sha256: t.sha256, start: t.start, end: t.end, redact_lines: t.redactLines, byte_limit: t.byteLimit });
+            const f = await take();
+            if (f.type !== 'lookup_result' || f.lookup_id !== t.lookupId) throw Object.assign(new Error('protocol_error'), { code: 'cli_error' });
+            return { ok: !!f.ok, sha256: f.sha256, text: f.text, reason: f.reason };
+          },
+        });
+        for (;;) {
+          const f = await take();
+          if (f.type === 'lookup') {
+            const lookupId = String(f.lookup_id || '');
+            let outcome;
+            try { outcome = await boundary.lookup(f.lookup?.kind, f.lookup?.args || {}, lookupId); }
+            catch (e) { outcome = { ok: false, code: 'lookup_denied', reason: String(e.message || e) }; }
+            sendFrame({ type: 'lookup_result', lookup_id: lookupId, ...outcome });
+          } else if (f.type === 'progress') {
+            send('progress', { text: String(f.text || '').slice(0, 300) });
+          } else if (f.type === 'result') {
+            return settle(resolve, { payload: f.payload || {}, profile: f.profile || profile || null, provider: f.provider || null, model: f.model || null });
+          } else if (f.type === 'failure') {
+            throw Object.assign(new Error(String(f.message || f.code)), { code: f.code });
+          } else {
+            throw Object.assign(new Error(`frame_order: ${f.type}`), { code: 'cli_error' });
+          }
+        }
+      } catch (e) {
+        if (e !== CLOSED) stopRequest(rec);
+        settle(reject, e === CANCELLED ? CLOSED : e);
+      }
+    })();
+  });
+}
 function hermesAsk(res, send, body) {
-  const mode = MODES[body.mode] || MODES.ask;
+  const modeKey = body.mode || 'ask';
+  const mode = MODES[modeKey] || MODES.ask;
   const question = String(body.question || '').slice(0, LIMITS.question);
   const turns = body.session ? historyFor(String(body.session), body.mode || 'ask') : [];
   if (body.session && !turns) {
@@ -529,111 +643,19 @@ function hermesAsk(res, send, body) {
     send('failure', { code: 'plugin_missing', message: 'Source-aware Ask needs a map rebuilt with the current Floorplan skill.' });
     return res.end();
   }
-  const id = crypto.randomBytes(6).toString('hex');
-  const child = spawn(cli.cmd, [...cli.args, ...(profile ? ['--profile', profile] : []), 'floorplan', 'ask', '--root', root],
-    { cwd: root, env: cliEnv(), detached: true, stdio: ['pipe', 'pipe', 'pipe'], windowsHide: true });
-  const rec = { child, engine: 'hermes' };
-  running.set(id, rec);
-  send('start', { id, engine: 'hermes', profile: profile || null });
-  // the only thing logged per request: id, pid, process-group id and start time (never argv or environment)
-  console.log(`hermes ask ${id} pid=${child.pid} pgid=${child.pid} started=${new Date().toISOString()}`);
-  const inbox = [], waiters = [];
-  let outSeq = 0, buf = '', stderr = '', finished = false;
-  const push = (f) => { const w = waiters.shift(); if (w) w(f); else inbox.push(f); };
-  const nextFrame = () => (inbox.length ? Promise.resolve(inbox.shift()) : new Promise((r) => waiters.push(r)));
-  const sendFrame = (frame) => { if (!child.stdin.destroyed) child.stdin.write(JSON.stringify({ v: 1, id, seq: outSeq++, ...frame }) + '\n'); };
-  // a stopped request ends silently: no late answer, and no failure either
-  const finish = (event, data) => { if (finished) return; finished = true; clearTimeout(deadline); if (event && !rec.silent) send(event, data); res.end(); };
-  const deadline = setTimeout(() => { stopRequest(rec); finish('failure', { code: 'timeout', message: 'Hermes did not answer within 180 seconds.' }); }, LIMITS.deadlineMs);
-  deadline.unref();
-  child.stdout.on('data', (d) => {
-    buf += d;
-    if (buf.length > LIMITS.frameBytes && !buf.includes('\n')) { stopRequest(rec); finish('failure', { code: 'cli_error', message: 'The worker sent an oversized frame.' }); return; }
-    let nl;
-    while ((nl = buf.indexOf('\n')) >= 0) {
-      const line = buf.slice(0, nl); buf = buf.slice(nl + 1);
-      if (!line.trim()) continue;
-      let frame; try { frame = JSON.parse(line); } catch { finish('failure', { code: 'cli_error', message: 'The worker sent invalid JSON.' }); return; }
-      const bad = frameProblem(frame, { id, bytes: line.length });
-      if (bad) { finish('failure', { code: 'cli_error', message: `Protocol: ${bad}` }); return; }
-      push(frame);
-    }
-  });
-  child.stderr.on('data', (d) => { stderr = (stderr + d).slice(-2000); });
-  // stderr and spawn errors can name absolute install paths: log them here, never send them to the page
-  child.on('error', (e) => { console.error(`hermes ask ${id} could not start: ${e.message}`); finish('failure', { code: 'cli_error', message: 'The ask worker could not start.' }); });
-  child.on('close', (code) => {
-    running.delete(id);
-    if (finished) return;
-    if (stderr.trim()) console.error(`hermes ask ${id} exited with code ${code}: ${stderr.trim()}`);
-    finish('failure', { code: 'cli_error', message: 'The ask worker stopped before answering.' });
-  });
-  res.on('close', () => { if (!finished) { finished = true; clearTimeout(deadline); running.delete(id); stopRequest(rec); } });
-  (async () => {
-    let seq = -1;
-    const take = async () => {
-      const f = await nextFrame();
-      if (f.seq <= seq) throw Object.assign(new Error('frame_out_of_order'), { code: 'cli_error' });
-      seq = f.seq;
-      return f;
-    };
-    try {
-      sendFrame({ type: 'start', done: false, mode: body.mode || 'ask', profile: profile || '', graph_digest: graphDigest,
-        instructions: mode.instructions, schema: mode.schema, question, history: (turns || []).map((t) => ({ q: t.q, a: t.a })),
-        overview: core.q.overview() });
-      const first = await take();
-      if (first.type === 'failure') { finish('failure', { code: first.code, message: first.message }); return; }
-      if (first.type !== 'ready') throw Object.assign(new Error('frame_order'), { code: 'cli_error' });
-      const boundary = new Boundary({
-        root, graph: G, blueprint: G.meta?.blueprint || null, mode: body.mode || 'ask', fingerprints,
-        query: core.q, findIssues,
-        read: async (rel, lookupId) => {
-          sendFrame({ type: 'classify_read', lookup_id: lookupId, path: rel });
-          const f = await take();
-          if (f.type === 'failure') throw Object.assign(new Error('worker_failed'), { code: f.code });
-          if (f.type !== 'source_bytes' || f.lookup_id !== lookupId) throw Object.assign(new Error('protocol_error'), { code: 'cli_error' });
-          return f.ok ? { ok: true, sha256: f.sha256, bytes_base64: f.bytes_base64 } : { ok: false, reason: f.reason };
-        },
-        ticket: async (t) => {
-          sendFrame({ type: 'source_ticket', lookup_id: t.lookupId, root_digest: t.rootDigest, mode: t.mode, path: t.path,
-            sha256: t.sha256, start: t.start, end: t.end, redact_lines: t.redactLines, byte_limit: t.byteLimit });
-          const f = await take();
-          if (f.type !== 'lookup_result' || f.lookup_id !== t.lookupId) throw Object.assign(new Error('protocol_error'), { code: 'cli_error' });
-          return { ok: !!f.ok, sha256: f.sha256, text: f.text, reason: f.reason };
-        },
-      });
-      for (;;) {
-        const f = await take();
-        if (f.type === 'lookup') {
-          const lookupId = String(f.lookup_id || '');
-          let outcome;
-          try { outcome = await boundary.lookup(f.lookup?.kind, f.lookup?.args || {}, lookupId); }
-          catch (e) { outcome = { ok: false, code: 'lookup_denied', reason: String(e.message || e) }; }
-          sendFrame({ type: 'lookup_result', lookup_id: lookupId, ...outcome });
-        } else if (f.type === 'progress') {
-          send('progress', { text: String(f.text || '').slice(0, 300) });
-        } else if (f.type === 'result') {
-          const payload = f.payload || {};
-          const problems = [...validateSchema(mode.schema, payload),
-            ...(body.mode === 'flow' ? flowProblems(payload, core.q.exists) : answerProblems(payload, core.q.exists))];
-          if (problems.length) { finish('failure', { code: 'invalid_json', message: problems.slice(0, 3).join('; ') }); return; }
-          const handle = body.session || crypto.randomBytes(8).toString('hex');
-          remember(handle, body.mode || 'ask', [...(turns || []), { q: question.slice(0, LIMITS.turnQuestion),
-            a: String(payload.answer || payload.description || '').slice(0, LIMITS.turnAnswer) }]);
-          finish('answer', { ...payload, session: handle, engine: 'hermes', profile: f.profile || profile || null,
-            provider: f.provider || null, model: f.model || null });
-          return;
-        } else if (f.type === 'failure') {
-          finish('failure', { code: f.code, message: f.message });
-          return;
-        } else {
-          throw Object.assign(new Error(`frame_order: ${f.type}`), { code: 'cli_error' });
-        }
-      }
-    } catch (e) {
-      finish('failure', { code: e.code || 'cli_error', message: String(e.message || e).slice(0, 300) });
-    }
-  })();
+  const rec = { id: crypto.randomBytes(6).toString('hex'), engine: 'hermes', children: new Set(), cancelled: false, silent: false, publishing: false };
+  running.set(rec.id, rec);
+  hermesRun(res, send, body, { mode: modeKey, question, instructions: mode.instructions, schema: mode.schema, rec, history: (turns || []).map((t) => ({ q: t.q, a: t.a })) })
+    .then((data) => {
+      const problems = [...validateSchema(mode.schema, data.payload),
+        ...(modeKey === 'flow' ? flowProblems(data.payload, core.q.exists) : answerProblems(data.payload, core.q.exists))];
+      if (problems.length) { send('failure', { code: 'invalid_json', message: problems.slice(0, 3).join('; ') }); return; }
+      const handle = body.session || crypto.randomBytes(8).toString('hex');
+      remember(handle, modeKey, [...(turns || []), { q: question.slice(0, LIMITS.turnQuestion),
+        a: String(data.payload.answer || data.payload.description || '').slice(0, LIMITS.turnAnswer) }]);
+      send('answer', { ...data.payload, session: handle, engine: 'hermes', profile: data.profile, provider: data.provider, model: data.model });
+    }, (e) => { if (e !== CLOSED) send('failure', { code: e.code || 'cli_error', message: String(e.message || e).slice(0, 300) }); })
+    .finally(() => { running.delete(rec.id); res.end(); });
 }
 
 // ---------- changing a blueprint from the map ----------
@@ -647,7 +669,10 @@ function snapshot() {
   const dir = path.join(historyDir, Date.now().toString(36));
   fs.mkdirSync(dir, { recursive: true });
   for (const f of PLAN_FILES) if (fs.existsSync(path.join(here, f))) fs.copyFileSync(path.join(here, f), path.join(dir, f));
-  for (const old of fs.readdirSync(historyDir).sort().slice(0, -20)) fs.rmSync(path.join(historyDir, old), { recursive: true, force: true });
+  // Legacy snapshots keep their last-20 policy. Preservation entries (a manifest.json) are a Change's
+  // recovery and Undo source: they are never pruned automatically.
+  const legacy = fs.readdirSync(historyDir).sort().filter((n) => !fs.existsSync(path.join(historyDir, n, 'manifest.json')));
+  for (const old of legacy.slice(0, -20)) fs.rmSync(path.join(historyDir, old), { recursive: true, force: true });
   return dir;
 }
 function restore(dir) {
@@ -700,37 +725,434 @@ function applyChange(data, request, lastTry) {
     return { errors: e.list || problems(e.message).slice(0, 12).concat(problems(e.message).length ? [] : [e.message.trim().split('\n').pop()]) };
   }
 }
+// ---------- a Hermes Change: staged build, preserve-first publication, no overwrite ----------
+// A Hermes Change never writes a live file before publication. It validates a candidate in a disposable
+// stage, then moves each actual live entry into owned history before installing the staged one only into
+// an empty pathname. That is recovery, not compare-and-swap: the real limits are stated in the failure.
+const LIVE_MEMBERS = ['plan.json', 'architecture.json', 'recent-work.json', '.cache/scan.json', 'graph.json',
+  'query.mjs', 'serve.mjs', 'hermes-boundary.mjs', '.cache/skill.json', '.gitignore', 'index.html'];
+const CHANGE_PLAN_FILES = ['plan.json', 'architecture.json', 'recent-work.json'];
+const CHANGE_BUDGET_MS = 300000;
+const showPath = (rel) => `floorplan/${rel}`;
+const livePath = (rel) => path.join(here, rel);
+const sha256File = (p) => crypto.createHash('sha256').update(fs.readFileSync(p)).digest('hex');
+const lstatOrNull = (p) => { try { return fs.lstatSync(p); } catch { return null; } };
+/** Tests inject a foreign write at one exact publication gap; production starts no hook at all. */
+let changeHook = null;
+const hookSeen = new Map();
+try { if (process.env.FLOORPLAN_CHANGE_HOOK) changeHook = JSON.parse(fs.readFileSync(process.env.FLOORPLAN_CHANGE_HOOK, 'utf8')); } catch { changeHook = null; }
+function hook(name, info = {}) {
+  if (!changeHook) return;
+  const spec = changeHook[name];
+  if (!spec || (spec.kind && spec.kind !== info.kind) || (spec.name && spec.name !== info.name)) return;
+  if (spec.once) { const n = (hookSeen.get(name) || 0) + 1; hookSeen.set(name, n); if (n !== spec.once) return; }
+  try {
+    if (spec.write) { fs.mkdirSync(path.dirname(spec.write.path), { recursive: true }); fs.writeFileSync(spec.write.path, String(spec.write.text ?? '')); }
+    if (spec.remove) fs.rmSync(spec.remove, { force: true });
+    if (spec.marker) fs.writeFileSync(spec.marker, String(spec.markerText ?? '1'));
+    if (spec.overwriteHeld) {
+      // rewrite the newest committed entry's retained Undo source, as a delayed writer would
+      const [name, text] = spec.overwriteHeld;
+      const entries = preservedEntries();
+      const last = entries[entries.length - 1];
+      const slot = last?.manifest?.undoPlan?.[name];
+      if (slot) fs.writeFileSync(path.join(last.dir, 'held', slot), String(text));
+    }
+  } catch {}
+}
+/** Every read-only build input: descriptions/*.json, custom-flows.json and health-dismissed.json. */
+function inputHashes() {
+  const out = {};
+  const descDir = path.join(here, 'descriptions');
+  try {
+    for (const name of fs.readdirSync(descDir).sort()) {
+      const p = path.join(descDir, name);
+      if (lstatOrNull(p)?.isFile()) out[`descriptions/${name}`] = sha256File(p);
+    }
+  } catch {}
+  for (const name of ['custom-flows.json', 'health-dismissed.json']) {
+    const p = livePath(name);
+    if (lstatOrNull(p)?.isFile()) out[name] = sha256File(p);
+  }
+  return out;
+}
+/** SHA-256 or absent for every live write-set member. */
+function captureLive() {
+  const out = {};
+  for (const rel of LIVE_MEMBERS) {
+    const p = livePath(rel);
+    const st = lstatOrNull(p);
+    if (!st) { out[rel] = { absent: true }; continue; }
+    if (!st.isFile()) return { error: `${showPath(rel)} is not a regular file.` };
+    out[rel] = { hash: sha256File(p) };
+  }
+  return { live: out };
+}
+function changedLive(expected) {
+  const out = [];
+  for (const rel of LIVE_MEMBERS) {
+    const want = expected[rel];
+    if (!want) continue;
+    const p = livePath(rel);
+    const st = lstatOrNull(p);
+    if (want.absent ? !!st : (!st || !st.isFile() || sha256File(p) !== want.hash)) out.push(showPath(rel));
+  }
+  return out;
+}
+function changedInputs(before) {
+  const now = inputHashes();
+  return [...new Set([...Object.keys(before), ...Object.keys(now)])].filter((k) => before[k] !== now[k]).map((k) => `floorplan/${k}`);
+}
+/** Refuses symlinked or nonregular map/output/history paths, and a filesystem without hard links. */
+function environmentProblem() {
+  if (process.env.FLOORPLAN_CHANGE_TEST_NO_LINKS === '1') return 'Hard links are unavailable on this filesystem.';
+  for (const p of [here, path.join(here, '.cache')]) {
+    const st = lstatOrNull(p);
+    if (st?.isSymbolicLink()) return `${p} is a symlink.`;
+    if (st && !st.isDirectory()) return `${p} is not a folder.`;
+  }
+  const hst = lstatOrNull(historyDir);
+  if (hst?.isSymbolicLink()) return `${historyDir} is a symlink.`;
+  if (hst && !hst.isDirectory()) return `${historyDir} is not a folder.`;
+  for (const rel of LIVE_MEMBERS) {
+    const st = lstatOrNull(livePath(rel));
+    if (st?.isSymbolicLink()) return `${showPath(rel)} is a symlink.`;
+    if (st && !st.isFile()) return `${showPath(rel)} is not a regular file.`;
+  }
+  try {
+    fs.mkdirSync(path.join(here, '.cache'), { recursive: true });
+    const dev = fs.statSync(here).dev;
+    for (const d of [here, path.join(here, '.cache')]) if (fs.statSync(d).dev !== dev) return 'The map spans filesystems, so a change cannot preserve files safely.';
+    const a = path.join(here, '.cache', `.link-probe-${process.pid}-${Date.now()}`);
+    const b = `${a}-b`;
+    try {
+      fs.writeFileSync(a, 'probe');
+      fs.linkSync(a, b);
+      if (fs.statSync(b).ino !== fs.statSync(a).ino) return 'Hard links are unavailable on this filesystem.';
+    } finally { fs.rmSync(a, { force: true }); fs.rmSync(b, { force: true }); }
+  } catch { return 'Hard links are unavailable on this filesystem.'; }
+  return null;
+}
+/** The disposable stage: read-only inputs copied, candidate plan inputs written there, nothing live. */
+function makeStage(id) {
+  const stage = path.join(here, '.cache', `change-${id}`);
+  fs.mkdirSync(stage, { recursive: true });
+  const st = lstatOrNull(stage);
+  if (!st || st.isSymbolicLink() || !st.isDirectory()) throw Object.assign(new Error('The change staging folder is not safe to use.'), { code: 'unsupported_runtime' });
+  const descDir = path.join(here, 'descriptions');
+  try {
+    for (const name of fs.readdirSync(descDir)) {
+      const from = path.join(descDir, name);
+      if (!lstatOrNull(from)?.isFile()) continue;
+      fs.mkdirSync(path.join(stage, 'descriptions'), { recursive: true });
+      fs.copyFileSync(from, path.join(stage, 'descriptions', name));
+    }
+  } catch {}
+  for (const name of ['custom-flows.json', 'health-dismissed.json']) {
+    const from = livePath(name);
+    if (lstatOrNull(from)?.isFile()) fs.copyFileSync(from, path.join(stage, name));
+  }
+  return stage;
+}
+function writeCandidate(stage, payload, request) {
+  const write = (rel, v) => fs.writeFileSync(path.join(stage, rel), JSON.stringify(v, null, 2) + '\n');
+  write('plan.json', JSON.parse(payload.plan));
+  write('architecture.json', JSON.parse(payload.architecture));
+  const items = (Array.isArray(payload.changes) ? payload.changes : []).filter((c) => c && typeof c.ref === 'string')
+    .map((c) => ({ ref: c.ref, change: c.change === 'changed' ? 'changed' : 'new', note: String(c.note || '') }));
+  // the Recent work panel shows plain text: the summary's first paragraph, without Markdown marks
+  const plain = String(payload.summary || '').split(/\n\s*\n/)[0].replace(/\*\*|__|`/g, '').replace(/\s+/g, ' ').trim();
+  write('recent-work.json', { updatedAt: new Date().toISOString(), tasks: [{ title: String(payload.title || 'Changed the plan').slice(0, 80), request, summary: plain, status: 'planned, not built', items }] });
+}
+/** Runs one of the skill's validators as a request-owned child, so Stop takes it and its descendants. */
+function runScript(rec, name, args) {
+  return new Promise((resolve, reject) => {
+    let dir;
+    try { dir = JSON.parse(fs.readFileSync(path.join(here, '.cache', 'skill.json'), 'utf8')).dir; } catch {}
+    if (!dir || !fs.existsSync(path.join(dir, 'scripts', name))) return reject(Object.assign(new Error('This map’s server can’t find the Floorplan scripts. Ask Hermes to update the floorplan once, then try again.'), { checks: true }));
+    if (rec.cancelled) return reject(CANCELLED);
+    const child = spawn(process.execPath, [path.join(dir, 'scripts', name), root, ...args], { cwd: root, stdio: ['ignore', 'pipe', 'pipe'], windowsHide: true, detached: true });
+    rec.children.add(child);
+    let out = '', err = '';
+    child.stdout.on('data', (d) => { out += d; });
+    child.stderr.on('data', (d) => { err += d; });
+    child.on('error', (e) => { rec.children.delete(child); reject(e); });
+    child.on('close', (code) => {
+      rec.children.delete(child);
+      if (rec.cancelled) return reject(CANCELLED);
+      if (code === 0) return resolve(out);
+      reject(Object.assign(new Error(String(out || '') + String(err || '') || `${name} exited with code ${code}`), { checks: true }));
+    });
+  });
+}
+async function validateStage(rec, stage, lastTry) {
+  await runScript(rec, 'plan.mjs', ['--plan', path.join(stage, 'plan.json'), '--out', stage]);
+  const check = await runScript(rec, 'build.mjs', ['--out', stage, '--check']);
+  const unassigned = +(/(\d+) unassigned/.exec(check)?.[1] || 0);
+  if (unassigned && !lastTry) throw Object.assign(new Error(''), { checks: true, list: [`${unassigned} planned file(s) fall under no node's paths in architecture.json (add or widen globs)`] });
+  await runScript(rec, 'build.mjs', ['--out', stage, '--agent', 'hermes', '--no-claude-md']);
+  return check;
+}
+function changeProblems(p) {
+  const out = [];
+  for (const k of ['plan', 'architecture']) {
+    const text = typeof p?.[k] === 'string' ? p[k] : '';
+    if (!text) { out.push(`${k} is missing`); continue; }
+    if (Buffer.byteLength(text) > 1024 * 1024) { out.push(`${k} is over 1 MiB`); continue; }
+    try { const v = JSON.parse(text); if (!v || typeof v !== 'object' || Array.isArray(v)) out.push(`${k} isn't a JSON object`); } catch { out.push(`${k} isn't valid JSON`); }
+  }
+  if (String(p?.title || '').length > 120) out.push('title is over 120 characters');
+  if (Array.isArray(p?.followups) && p.followups.length > 3) out.push('followups must be 0-3');
+  if (Buffer.byteLength(JSON.stringify(p)) > 1024 * 1024) out.push('the change is over 1 MiB');
+  return out;
+}
+function ensureHistory() {
+  const base = path.join(here, '.cache');
+  fs.mkdirSync(base, { recursive: true });
+  const bs = fs.lstatSync(base);
+  if (bs.isSymbolicLink() || !bs.isDirectory()) throw new Error('the map cache folder is not safe to use');
+  fs.mkdirSync(historyDir, { recursive: true });
+  const hs = fs.lstatSync(historyDir);
+  if (hs.isSymbolicLink() || !hs.isDirectory()) throw new Error('the map history folder is not safe to use');
+}
+function newPreservationDir(rec) {
+  ensureHistory();
+  for (let n = 0; n < 20; n++) {
+    const dir = path.join(historyDir, `${Date.now().toString(36)}-${rec.id}${n ? `-${n}` : ''}`);
+    try { fs.mkdirSync(dir); return dir; } catch (e) { if (e.code !== 'EEXIST') throw e; }
+  }
+  throw new Error('Could not create a history folder for this change.');
+}
+function preservedEntries() {
+  if (!fs.existsSync(historyDir)) return [];
+  const out = [];
+  for (const name of fs.readdirSync(historyDir).sort()) {
+    const dir = path.join(historyDir, name);
+    let manifest = null;
+    try { manifest = JSON.parse(fs.readFileSync(path.join(dir, 'manifest.json'), 'utf8')); } catch {}
+    if (manifest) out.push({ name, dir, manifestPath: path.join(dir, 'manifest.json'), manifest });
+  }
+  return out;
+}
+/** Move-before-inspection rollback: every moved entry stays in <H>, an occupied path is never replaced. */
+function rollbackPreserved(H, manifest, installedOrder, expected, failed, conflicts, writeManifest) {
+  const liveOf = (rel) => livePath(rel);
+  const restoreHeld = (rel) => {
+    const slot = manifest.held[rel];
+    if (!slot) return;
+    const held = path.join(H, 'held', slot);
+    if (!lstatOrNull(held)) return;
+    try { fs.linkSync(held, liveOf(rel)); }
+    catch (e) { conflicts[showPath(rel)] = `the baseline is kept at ${path.relative(root, held)} (the path was occupied: ${e.code || e.message})`; }
+  };
+  if (failed) restoreHeld(failed);
+  let n = 0;
+  for (const rel of [...installedOrder].reverse()) {
+    if (rel === failed) continue;
+    const live = liveOf(rel);
+    const want = manifest.installed[rel] || {};
+    const displaced = path.join(H, 'displaced', `${String(++n).padStart(2, '0')}-${path.basename(rel)}`);
+    let moved = false;
+    try { fs.renameSync(live, displaced); moved = true; }
+    catch (e) { if (e.code !== 'ENOENT') { conflicts[showPath(rel)] = `it could not be moved aside (${e.code || e.message})`; continue; } }
+    if (!moved) {
+      // it disappeared: only an exclusive baseline restoration is allowed
+      if (!expected[rel]?.absent) restoreHeld(rel);
+      continue;
+    }
+    hook('rollbackAfterMove', { name: showPath(rel), kind: manifest.kind });
+    const st = lstatOrNull(displaced);
+    const ours = !want.absent && st && !st.isSymbolicLink() && st.isFile() && st.ino === want.ino && st.dev === want.dev;
+    if (ours) {
+      if (!expected[rel]?.absent) restoreHeld(rel); // an originally absent member is left absent
+    } else {
+      try { fs.linkSync(displaced, live); }
+      catch (e) { conflicts[showPath(rel)] = `its displaced file is kept at ${path.relative(root, displaced)} (${e.code || e.message})`; }
+    }
+  }
+  writeManifest();
+}
+/**
+ * Publish a validated stage. Preflight hashes come first; a mismatch publishes nothing. On conflict
+ * every held/displaced inode is retained and no reload is sent; complete success sends exactly one.
+ */
+function publishStage(rec, stage, { kind, request, expected, inputs, send, allowAbsent = new Set() }) {
+  const changed = changedLive(expected);
+  const inputChanges = changedInputs(inputs || {});
+  if (changed.length || inputChanges.length) {
+    return { conflict: true, message: `The map changed while this ${kind === 'undo' ? 'undo' : 'change'} was being prepared, so nothing was published. Changed: ${[...changed, ...inputChanges].join(', ')}.` };
+  }
+  rec.publishing = true;
+  if (send) send('progress', { text: 'Publishing the updated plan' });
+  const H = newPreservationDir(rec);
+  const manifest = { preservation: true, kind, request, at: new Date().toISOString(), status: 'publishing', baseline: expected, held: {}, installed: {}, published: {}, undoPlan: {} };
+  const writeManifest = () => fs.writeFileSync(path.join(H, 'manifest.json'), JSON.stringify(manifest, null, 2) + '\n');
+  writeManifest();
+  fs.mkdirSync(path.join(H, 'held'));
+  fs.mkdirSync(path.join(H, 'displaced'));
+  const installedOrder = [];
+  const conflicts = {};
+  let failed = null;
+  const fail = (rel, reason) => { conflicts[showPath(rel)] = reason; failed = rel; throw Object.assign(new Error(reason), { conflict: true }); };
+  try {
+    for (let i = 0; i < LIVE_MEMBERS.length; i++) {
+      const rel = LIVE_MEMBERS[i];
+      const live = livePath(rel);
+      const staged = path.join(stage, rel);
+      const held = path.join(H, 'held', `${String(i + 1).padStart(2, '0')}-${path.basename(rel)}`);
+      const want = expected[rel] || { absent: true };
+      const stageLst = lstatOrNull(staged);
+      hook('beforeMove', { name: showPath(rel), kind });
+      if (!stageLst && !allowAbsent.has(rel)) fail(rel, 'the staged file is missing');
+      if (stageLst?.isSymbolicLink() || (stageLst && !stageLst.isFile())) fail(rel, 'the staged file is not a regular file');
+      const lst = lstatOrNull(live);
+      if (lst?.isSymbolicLink()) fail(rel, 'it is a symlink');
+      if (lst) {
+        try { fs.renameSync(live, held); } catch (e) { if (e.code === 'ENOENT') fail(rel, 'it disappeared while the change was being saved'); throw e; }
+        // record the move before inspecting it: a conflict must still know what it owns
+        manifest.held[rel] = path.basename(held);
+        if (CHANGE_PLAN_FILES.includes(rel)) manifest.undoPlan[rel] = path.basename(held);
+        const hst = lstatOrNull(held);
+        if (!hst || hst.isSymbolicLink() || !hst.isFile()) fail(rel, 'it was replaced by something that is not a regular file');
+        if (want.absent) fail(rel, 'a file appeared where there was none');
+        if (sha256File(held) !== want.hash) fail(rel, 'it was edited while the change was being saved');
+      } else if (!want.absent) {
+        fail(rel, 'it disappeared while the change was being saved');
+      }
+      hook('beforeLink', { name: showPath(rel), kind });
+      if (stageLst) {
+        try { fs.linkSync(staged, live); }
+        catch (e) { fail(rel, e.code === 'EEXIST' ? 'another file appeared in its place' : `it could not be replaced (${e.code || e.message})`); }
+        const st = lstatOrNull(live);
+        if (!st || st.isSymbolicLink() || !st.isFile()) fail(rel, 'the installed file is not a regular file');
+        const hash = sha256File(live);
+        manifest.installed[rel] = { dev: st.dev, ino: st.ino, hash };
+        manifest.published[rel] = hash;
+        installedOrder.push(rel);
+      } else {
+        manifest.installed[rel] = { absent: true };
+      }
+      writeManifest();
+    }
+  } catch (e) {
+    if (!e.conflict) conflicts[showPath(failed || 'a live file')] = String(e.message || e);
+    rollbackPreserved(H, manifest, installedOrder, expected, failed, conflicts, writeManifest);
+    manifest.status = 'conflict';
+    manifest.conflict = true;
+    writeManifest();
+    const relH = path.relative(root, H).replace(/\\/g, '/');
+    fs.writeFileSync(path.join(H, 'conflict.json'), JSON.stringify({
+      preservation: true, conflict: true, at: new Date().toISOString(), request, kind,
+      live: conflicts,
+      held: Object.fromEntries(Object.entries(manifest.held).map(([rel, slot]) => [showPath(rel), `${relH}/held/${slot}`])),
+      displaced: fs.existsSync(path.join(H, 'displaced')) ? fs.readdirSync(path.join(H, 'displaced')).map((n) => `${relH}/displaced/${n}`) : [],
+    }, null, 2) + '\n');
+    rec.publishing = false;
+    addSelfIndexWrite();
+    return { conflict: true, message: `The map changed while this ${kind === 'undo' ? 'undo' : 'change'} was being saved, so nothing was overwritten. The files it kept are in ${relH}/ (see ${relH}/conflict.json).` };
+  }
+  manifest.status = 'ok';
+  manifest.ok = true;
+  writeManifest();
+  rec.publishing = false;
+  addSelfIndexWrite();
+  try { load(); } catch {}
+  broadcast('reload');
+  return { ok: true, undo: path.basename(H) };
+}
+const retryQuestion = (errors, request) => `Your updated plan didn't pass the checks, so nothing was saved:\n${errors.map((e) => `- ${e}`).join('\n')}\n\nFix these and reply again with the complete files. The request was: ${request}`;
+async function hermesChange(res, send, body, request) {
+  if (!findIssues) { send('failure', { code: 'plugin_missing', message: 'Source-aware Change needs a map rebuilt with the current Floorplan skill.' }); return; }
+  const env = environmentProblem();
+  if (env) { send('failure', { code: 'unsupported_runtime', message: env }); return; }
+  const baseline = captureLive();
+  if (baseline.error) { send('failure', { code: 'unsupported_runtime', message: baseline.error }); return; }
+  const inputs = inputHashes();
+  const started = Date.now();
+  const stage = makeStage(crypto.randomBytes(6).toString('hex'));
+  let errors = null;
+  try {
+    for (let attempt = 0; attempt < 2; attempt++) {
+      if (Date.now() - started > CHANGE_BUDGET_MS) throw Object.assign(new Error('Hermes did not finish the change within 300 seconds.'), { code: 'timeout' });
+      const rec = { id: crypto.randomBytes(6).toString('hex'), engine: 'hermes', children: new Set(), cancelled: false, silent: false, publishing: false, kind: 'change' };
+      running.set(rec.id, rec);
+      try {
+        const question = errors ? retryQuestion(errors, request) : request;
+        const remaining = Math.max(1000, started + CHANGE_BUDGET_MS - Date.now());
+        const data = await hermesRun(res, send, body, { mode: 'change', question, instructions: MODES.change.instructions, schema: MODES.change.schema, rec, deadlineMs: Math.min(CHANGE_BUDGET_MS, remaining) });
+        if (rec.cancelled || rec.silent) return;
+        const issues = [...validateSchema(MODES.change.schema, data.payload), ...changeProblems(data.payload)];
+        if (issues.length) {
+          errors = issues.slice(0, 12);
+          send('progress', { text: `Fixing ${errors.length === 1 ? 'a problem' : `${errors.length} problems`} the checks found` });
+          continue;
+        }
+        send('progress', { text: 'Checking the updated plan' });
+        writeCandidate(stage, data.payload, request);
+        try {
+          await validateStage(rec, stage, attempt === 1);
+        } catch (e) {
+          if (e === CANCELLED || rec.cancelled || rec.silent || e === CLOSED) return;
+          if (!e.checks) throw e;
+          errors = e.list || problems(e.message).slice(0, 12).concat(problems(e.message).length ? [] : [String(e.message || '').trim().split('\n').pop()]);
+          send('progress', { text: `Fixing ${errors.length === 1 ? 'a problem' : `${errors.length} problems`} the checks found` });
+          continue;
+        }
+        if (rec.cancelled || rec.silent) return;
+        const r = publishStage(rec, stage, { kind: 'change', request, expected: baseline.live, inputs, send });
+        if (r.conflict) { send('failure', { code: 'conflict', message: r.message }); return; }
+        console.log(`plan changed: ${data.payload.title || request.slice(0, 60)}`);
+        send('answer', { title: String(data.payload.title || ''), summary: String(data.payload.summary || ''), changes: Array.isArray(data.payload.changes) ? data.payload.changes.length : 0, followups: Array.isArray(data.payload.followups) ? data.payload.followups.map(String).slice(0, 3) : [], undo: r.undo });
+        return;
+      } finally { running.delete(rec.id); }
+    }
+    send('failure', { code: 'change_invalid', message: `The updated plan didn't pass the checks, so nothing changed:\n${errors.slice(0, 6).map((e) => `- ${e}`).join('\n')}` });
+  } finally {
+    fs.rmSync(stage, { recursive: true, force: true });
+  }
+}
 async function changePlan(res, send, body) {
   const request = String(body.question || '').slice(0, 4000);
   if (!MODES.change) { send('failure', { code: 'cli_error', message: G.meta?.blueprint ? `${ENGINES[engine].name} can't change a plan from the map.` : 'Only a blueprint can be changed from the map.' }); return res.end(); }
   if (changing) { send('failure', { code: 'busy', message: 'Another change to this plan is still being made. Try again when it’s done.' }); return res.end(); }
   changing = true;
-  let session, errors = null;
   try {
-    for (let attempt = 0; attempt < 2; attempt++) {
-      const question = errors
-        ? `Your updated plan didn't pass the checks, so nothing was saved:\n${errors.map((e) => `- ${e}`).join('\n')}\n\nFix these and reply again with the complete files. The request was: ${request}`
-        : request;
-      const data = await runAgent(res, send, { question, session, mode: 'change' });
-      session = data.session || session;
-      send('progress', { text: 'Checking the updated plan' });
-      const r = applyChange(data, request, attempt === 1);
-      if (r.ok) {
-        console.log(`plan changed: ${data.title || request.slice(0, 60)}`);
-        send('answer', { title: String(data.title || ''), summary: String(data.summary || ''), changes: (data.changes || []).length, followups: Array.isArray(data.followups) ? data.followups.map(String).slice(0, 3) : [], undo: r.undo });
-        return;
-      }
-      errors = r.errors;
-      send('progress', { text: `Fixing ${errors.length === 1 ? 'a problem' : `${errors.length} problems`} the checks found` });
-    }
-    send('failure', { code: 'change_invalid', message: `The updated plan didn't pass the checks, so nothing changed:\n${errors.slice(0, 6).map((e) => `- ${e}`).join('\n')}` });
+    if (ENGINES[engine].protocol) await hermesChange(res, send, body, request);
+    else await legacyChange(res, send, body, request);
   } catch (e) {
-    if (e !== CLOSED) send('failure', { code: failCode(String(e.message || e)), message: String(e.message || e) });
+    if (e !== CLOSED && e !== CANCELLED) send('failure', { code: e.code || failCode(String(e.message || e)), message: String(e.message || e) });
   } finally { changing = false; res.end(); }
 }
-/** Puts back the files a change replaced (the newest first), and redraws. */
-function undoChange() {
-  const all = fs.existsSync(historyDir) ? fs.readdirSync(historyDir).sort() : [];
+/** Claude Code and Codex keep the upstream apply: write, validate, restore the start snapshot on failure. */
+async function legacyChange(res, send, body, request) {
+  let session, errors = null;
+  for (let attempt = 0; attempt < 2; attempt++) {
+    const question = errors ? retryQuestion(errors, request) : request;
+    const data = await runAgent(res, send, { question, session, mode: 'change' });
+    session = data.session || session;
+    send('progress', { text: 'Checking the updated plan' });
+    const r = applyChange(data, request, attempt === 1);
+    if (r.ok) {
+      console.log(`plan changed: ${data.title || request.slice(0, 60)}`);
+      send('answer', { title: String(data.title || ''), summary: String(data.summary || ''), changes: (data.changes || []).length, followups: Array.isArray(data.followups) ? data.followups.map(String).slice(0, 3) : [], undo: r.undo });
+      return;
+    }
+    errors = r.errors;
+    send('progress', { text: `Fixing ${errors.length === 1 ? 'a problem' : `${errors.length} problems`} the checks found` });
+  }
+  send('failure', { code: 'change_invalid', message: `The updated plan didn't pass the checks, so nothing changed:\n${errors.slice(0, 6).map((e) => `- ${e}`).join('\n')}` });
+}
+/** Undo: legacy snapshots keep their policy; a Hermes change uses its recorded plan baseline. */
+async function undoChange() {
+  if (changing) return { ok: false, error: 'A change is still being made.' };
+  changing = true;
+  try { return ENGINES[engine]?.protocol ? await undoHermes() : undoLegacy(); }
+  finally { changing = false; }
+}
+function undoLegacy() {
+  const all = fs.existsSync(historyDir)
+    ? fs.readdirSync(historyDir).sort().filter((n) => !fs.existsSync(path.join(historyDir, n, 'manifest.json')))
+    : [];
   if (!all.length) return { ok: false, error: 'Nothing to undo.' };
   const dir = path.join(historyDir, all[all.length - 1]);
   restore(dir);
@@ -740,6 +1162,50 @@ function undoChange() {
   }
   fs.rmSync(dir, { recursive: true, force: true });
   return { ok: true, left: all.length - 1 };
+}
+async function undoHermes() {
+  const env = environmentProblem();
+  if (env) return { ok: false, error: env };
+  const entries = preservedEntries().filter((e) => e.manifest.preservation && e.manifest.kind === 'change' && e.manifest.ok && !e.manifest.undone && !e.manifest.conflict);
+  if (!entries.length) return { ok: false, error: 'Nothing to undo.' };
+  const entry = entries[entries.length - 1];
+  const m = entry.manifest;
+  const inputs = inputHashes();
+  const rec = { id: crypto.randomBytes(6).toString('hex'), engine: 'hermes', children: new Set(), cancelled: false, silent: false, publishing: false, kind: 'undo' };
+  running.set(rec.id, rec);
+  const stage = makeStage(rec.id);
+  try {
+    const sources = {};
+    for (const rel of CHANGE_PLAN_FILES) {
+      const slot = m.undoPlan?.[rel];
+      const held = slot ? path.join(entry.dir, 'held', slot) : null;
+      if (held && fs.existsSync(held)) { fs.copyFileSync(held, path.join(stage, rel)); sources[rel] = { path: held, hash: sha256File(held) }; }
+    }
+    hook('undoSourcesCopied', { kind: 'undo' });
+    try { await validateStage(rec, stage, true); } catch (e) {
+      if (e === CANCELLED) return { ok: false, error: 'Stopped.' };
+      console.error(`✗ Undo couldn't redraw the previous plan: ${e.message || e}`);
+      return { ok: false, error: 'Couldn’t redraw the previous plan. The details are in the map server’s output.' };
+    }
+    for (const s of Object.values(sources)) {
+      const st = lstatOrNull(s.path);
+      if (!st || st.isSymbolicLink() || !st.isFile() || sha256File(s.path) !== s.hash) {
+        return { ok: false, error: `The history this undo restores from changed while it was being checked, so nothing was published. It is kept at ${path.relative(root, entry.dir).replace(/\\/g, '/')}/.` };
+      }
+    }
+    const expected = {};
+    for (const rel of LIVE_MEMBERS) expected[rel] = m.published?.[rel] ? { hash: m.published[rel] } : { absent: true };
+    const allowAbsent = new Set(CHANGE_PLAN_FILES.filter((rel) => !m.undoPlan?.[rel]));
+    const r = publishStage(rec, stage, { kind: 'undo', request: `Undo: ${m.request || ''}`, expected, inputs, allowAbsent });
+    if (r.conflict) return { ok: false, error: r.message };
+    m.undone = true;
+    m.undoneAt = new Date().toISOString();
+    fs.writeFileSync(entry.manifestPath, JSON.stringify(m, null, 2) + '\n');
+    return { ok: true, left: entries.length - 1 };
+  } finally {
+    running.delete(rec.id);
+    fs.rmSync(stage, { recursive: true, force: true });
+  }
 }
 
 // ---------- http ----------
@@ -815,8 +1281,14 @@ const server = http.createServer((req, res) => {
       }
     }
     if (req.method === 'POST' && url.pathname === '/api/plan/undo') {
-      const r = changing ? { ok: false, error: 'A change is still being made.' } : undoChange();
-      res.writeHead(200, { 'Content-Type': 'application/json' }); return res.end(JSON.stringify(r));
+      undoChange().then((r) => {
+        res.writeHead(200, { 'Content-Type': 'application/json' }); res.end(JSON.stringify(r));
+      }, (e) => {
+        console.error(`✗ Undo failed: ${e.message || e}`);
+        res.writeHead(500, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ ok: false, error: 'Couldn’t undo. The details are in the map server’s output.' }));
+      });
+      return;
     }
     if (req.method === 'POST' && url.pathname === '/api/cancel') {
       let raw = '';

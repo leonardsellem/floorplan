@@ -188,7 +188,7 @@ class AskTest(unittest.TestCase):
         path.write_text(text, encoding=encoding)
         return path
 
-    def frames(self, name, *, start=1, end=2, redact=(), sha=None, lookup_id="req1-0"):
+    def frames(self, name, *, start=1, end=2, redact=(), sha=None, lookup_id="req1-0", mode="ask"):
         """The worker's view of one read: classify, a ticket for those bytes, then its redacted window."""
         p = name
         text = ""
@@ -201,7 +201,7 @@ class AskTest(unittest.TestCase):
         return [
             {"v": 1, "id": "req1", "type": "classify_read", "seq": 1, "lookup_id": lookup_id, "path": p},
             {"v": 1, "id": "req1", "type": "source_ticket", "seq": 2, "lookup_id": lookup_id, "path": p,
-             "root_digest": ROOT_DIGEST(self.root), "mode": "ask", "sha256": sha or SHA(Path(self.root, p)),
+             "root_digest": ROOT_DIGEST(self.root), "mode": mode, "sha256": sha or SHA(Path(self.root, p)),
              "start": start, "end": end, "redact_lines": list(redact), "byte_limit": 32768},
             {"v": 1, "id": "req1", "type": "lookup_result", "seq": 3, "lookup_id": lookup_id, "ok": True, "text": text},
         ]
@@ -366,6 +366,19 @@ class AskTest(unittest.TestCase):
         code, out, llm = self.run_ask([start()], [FINAL], now=clock)
         self.assertEqual((code, out[-1]["code"]), (1, "timeout"))
         self.assertEqual(llm.calls, [])
+
+    def test_change_mode_has_the_300_second_budget_and_binds_change_tickets(self):
+        self.write("a.js", "one\ntwo")
+        clock = iter([0.0, 181.0, 181.0, 181.0]).__next__
+        code, out, llm = self.run_ask([start(mode="change"), *self.frames("a.js", mode="change")], [READ, FINAL], now=clock)
+        self.assertEqual((code, out[-1]["type"]), (0, "result"))
+        self.assertEqual(len(llm.calls), 2)
+
+    def test_a_ticket_issued_for_another_mode_is_refused(self):
+        self.write("a.js", "one\ntwo")
+        code, out, llm = self.run_ask([start(mode="change"), *self.frames("a.js", mode="ask")], [READ, FINAL])
+        self.assertEqual((out[3]["ok"], out[3]["reason"]), (False, "ticket_mismatch"))
+        self.assertNotIn("one\ntwo", llm.calls[1]["text"])
 
     def test_an_unsupported_platform_refuses_before_reading(self):
         original = self.runner.SUPPORTED

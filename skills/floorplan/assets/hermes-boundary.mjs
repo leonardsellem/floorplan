@@ -14,7 +14,7 @@ export const LIMITS = {
 export const FAILURE_CODES = new Set([
   'cli_missing', 'cli_error', 'not_logged_in', 'rate_limited', 'timeout', 'cancelled', 'busy',
   'model_override_denied', 'profile_mismatch', 'unsupported_runtime', 'plugin_missing',
-  'lookup_denied', 'invalid_json', 'session_expired', 'change_invalid', 'upstream_error',
+  'lookup_denied', 'invalid_json', 'session_expired', 'change_invalid', 'upstream_error', 'conflict',
 ]);
 
 const TYPES = new Set(['object', 'array', 'string', 'integer', 'boolean']);
@@ -193,6 +193,7 @@ function symlinkInPath(root, rel) {
 
 const sha256 = (buf) => crypto.createHash('sha256').update(buf).digest('hex');
 const sha1 = (buf) => crypto.createHash('sha1').update(buf).digest('hex');
+const decode = (base64) => Buffer.from(String(base64 || ''), 'base64');
 const within = (root, rel) => path.resolve(root, rel).startsWith(root + path.sep);
 
 /**
@@ -215,10 +216,33 @@ export class Boundary {
     this.lookups = 0;
     this.decisions = 0;
     this.returned = 0;
+    this.pinState = 'new';
     this.byPath = new Map(graph.files.map((f) => [f.p, f]));
   }
 
   opts() { return { blueprint: this.blueprint, prdPath: this.prdPath }; }
+
+  /**
+   * Blueprint only: pin the one PRD path from the plan bytes this request classifies, never from the
+   * model or from a stale map. A plan that changed since the build authorizes only what it names now.
+   */
+  async pinSource() {
+    if (!this.blueprint) return null;
+    this.prdPath = null;
+    let raw;
+    try { raw = await this.read('floorplan/plan.json', 'pin'); } catch { return null; }
+    if (!raw?.ok) return null;
+    const buf = decode(raw.bytes_base64);
+    if (raw.sha256 !== sha256(buf) || buf.length > LIMITS.rawBytes) return null;
+    const src = buf.toString('utf8');
+    if (Buffer.from(src, 'utf8').compare(buf) !== 0 || src.includes('\0')) return null;
+    let plan;
+    try { plan = JSON.parse(src); } catch { return null; }
+    const rel = typeof plan?.source === 'string' ? plan.source.trim() : '';
+    if (!rel || denyReason(rel)) return null;
+    this.prdPath = rel;
+    return rel;
+  }
 
   /** Refuses a path that the deny list or the map does not admit; null when readable. */
   eligible(rel) {
@@ -249,12 +273,17 @@ export class Boundary {
    * carries their full SHA-256, and the returned text must come back from that same buffer.
    */
   async readFile(rel, start, end, lookupId) {
+    // the PRD is authorized only by the plan bytes this request classified, pinned on first need
+    if (this.blueprint && this.pinState !== 'done' && rel !== 'floorplan/plan.json' && rel !== 'floorplan/architecture.json') {
+      this.pinState = 'done';
+      await this.pinSource();
+    }
     const why = this.eligible(rel);
     if (why) return REFUSED(why);
     if ((end - start + 1) > LIMITS.readLines) return REFUSED('too_many_lines');
     const raw = await this.read(rel, lookupId);
     if (!raw?.ok) return REFUSED(raw?.reason || 'unreadable');
-    const buf = Buffer.from(raw.bytes_base64, 'base64');
+    const buf = decode(raw.bytes_base64);
     if (buf.length > LIMITS.rawBytes) return REFUSED('too_large');
     if (raw.sha256 !== sha256(buf)) return REFUSED('changed');
     const hint = this.fingerprints.get(rel);
