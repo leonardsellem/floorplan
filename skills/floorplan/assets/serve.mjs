@@ -217,11 +217,14 @@ if (cli) { try { version = execFileSync(cli.cmd, [...cli.args, '--version'], { e
 // code). Loaded at start and again whenever the map is rebuilt.
 const inject = `<script>window.FLOORPLAN_SERVER=${JSON.stringify({ token, cli: !!cli, engine, want, version, model: model || null, profile: profile || null, source: engine === 'hermes' ? !!findIssues : null, change: canChange })};</script>`;
 const ENGINE_LANG = (k) => (k === 'hermes' ? 'hermes' : 'cli');
-// Server-owned follow-up store: a handle is bound to root, graph digest, engine, profile and mode.
+// Server-owned follow-up store: a handle is bound to root, the loaded build, graph digest, engine, profile and mode.
 const conversations = new Map();
-let page, G, core, MODES, graphDigest = '', fingerprints = new Map();
+let page, G, core, MODES, graphDigest = '', fingerprints = new Map(), indexMtime = 0;
 function load() {
-  const html = fs.readFileSync(path.join(here, 'index.html'), 'utf8');
+  const indexPath = path.join(here, 'index.html');
+  // the build this server is serving; stat before read so a build landing mid-load expires (never extends) follow-ups
+  indexMtime = fs.statSync(indexPath).mtimeMs;
+  const html = fs.readFileSync(indexPath, 'utf8');
   const rawGraph = fs.readFileSync(path.join(here, 'graph.json'), 'utf8');
   const g = JSON.parse(rawGraph);
   graphDigest = crypto.createHash('sha256').update(rawGraph).digest('hex');
@@ -479,6 +482,10 @@ const CONV_MAX = 100, CONV_IDLE = 30 * 60000, CONV_TURNS = 4;
 function historyFor(handle, mode) {
   const c = handle ? conversations.get(handle) : null;
   if (!c) return null;
+  // a rebuild on disk expires follow-ups now, not whenever the reload watcher next gets to it
+  let liveIndexMtime = null;
+  try { liveIndexMtime = fs.statSync(path.join(here, 'index.html')).mtimeMs; } catch {}
+  if (liveIndexMtime !== indexMtime) return null;
   if (c.root !== root || c.digest !== graphDigest || c.engine !== engine || c.profile !== profile || c.mode !== mode) return null;
   if (Date.now() - c.at > CONV_IDLE) { conversations.delete(handle); return null; }
   return c.turns;

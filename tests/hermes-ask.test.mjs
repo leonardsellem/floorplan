@@ -179,12 +179,9 @@ t('a rebuild resets follow-ups, and the page says so', async () => {
   const s = await serve(root);
   const [first] = pick(await ask(s, 'What is this?'), 'answer');
   run('build.mjs', root, '--no-claude-md', '--agent', 'hermes');
-  let failure = null;
-  for (let i = 0; i < 20 && !failure; i++) {
-    failure = pick(await ask(s, 'And then?', first.session), 'failure')[0] || null;
-    if (!failure) await new Promise((r) => setTimeout(r, 300));
-  }
-  assert.equal(failure?.code, 'session_expired');
+  // the handle must die with the build itself, not with the reload watcher's next tick
+  const events = await ask(s, 'And then?', first.session);
+  assert.equal(pick(events, 'failure')[0]?.code, 'session_expired');
 });
 
 t('Stop kills that request’s process group, and another request keeps running', async () => {
