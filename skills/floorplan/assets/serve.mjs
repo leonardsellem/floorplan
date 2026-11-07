@@ -502,9 +502,9 @@ function historyFor(handle, mode) {
   if (Date.now() - c.at > CONV_IDLE) { conversations.delete(handle); return null; }
   return c.turns;
 }
-function remember(handle, mode, turns) {
+function remember(handle, mode, digest, turns) {
   conversations.delete(handle);
-  conversations.set(handle, { root, digest: graphDigest, engine, profile, mode, turns: turns.slice(-CONV_TURNS), at: Date.now() });
+  conversations.set(handle, { root, digest, engine, profile, mode, turns: turns.slice(-CONV_TURNS), at: Date.now() });
   for (const [k, v] of conversations) if (conversations.size > CONV_MAX && Date.now() - v.at > CONV_IDLE) conversations.delete(k);
   while (conversations.size > CONV_MAX) conversations.delete(conversations.keys().next().value);
 }
@@ -651,6 +651,8 @@ function hermesRun(res, send, body, { mode, question, instructions, schema, rec,
 }
 function hermesAsk(res, send, body) {
   const modeKey = body.mode || 'ask';
+  // the build this request is accepted on: a rebuild while it runs must not re-bind its history
+  const acceptedDigest = graphDigest;
   const mode = MODES[modeKey] || MODES.ask;
   const question = String(body.question || '').slice(0, LIMITS.question);
   const turns = body.session ? historyFor(String(body.session), body.mode || 'ask') : [];
@@ -670,7 +672,7 @@ function hermesAsk(res, send, body) {
         ...(modeKey === 'flow' ? flowProblems(data.payload, core.q.exists) : answerProblems(data.payload, core.q.exists))];
       if (problems.length) { send('failure', { code: 'invalid_json', message: problems.slice(0, 3).join('; ') }); return; }
       const handle = body.session || crypto.randomBytes(8).toString('hex');
-      remember(handle, modeKey, [...(turns || []), { q: question.slice(0, LIMITS.turnQuestion),
+      remember(handle, modeKey, acceptedDigest, [...(turns || []), { q: question.slice(0, LIMITS.turnQuestion),
         a: String(data.payload.answer || data.payload.description || '').slice(0, LIMITS.turnAnswer) }]);
       send('answer', { ...data.payload, session: handle, engine: 'hermes', profile: data.profile, provider: data.provider, model: data.model });
     }, (e) => { if (e !== CLOSED) send('failure', { code: e.code || 'cli_error', message: String(e.message || e).slice(0, 300) }); })

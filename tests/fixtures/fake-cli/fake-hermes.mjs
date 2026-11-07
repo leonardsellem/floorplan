@@ -117,6 +117,16 @@ function handle(frame) {
       pumpChange();
       return;
     }
+    if (q.startsWith('HOLD')) {
+      // answer once <root>/release exists, so a test can release the answer after a rebuild
+      const release = path.join(root, 'release');
+      const wait = setInterval(() => {
+        if (!fs.existsSync(release)) return;
+        clearInterval(wait);
+        send({ type: 'result', payload: answerPayload(), provider: 'fake-provider', model: 'fake-model-1' });
+      }, 10);
+      return;
+    }
     if (q.startsWith('SLOW')) {
       // a result after the tab has already stopped: the server must drop it
       setTimeout(() => send({ type: 'result', payload: answerPayload(), provider: 'fake-provider', model: 'fake-model-1' }), 1500);
