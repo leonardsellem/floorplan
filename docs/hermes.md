@@ -28,9 +28,9 @@ hermes --profile <profile> plugins enable floorplan
 
 `--no-enable` installs without turning the plugin on, so checksums and `plugins doctor` run before anything loads. Restart that profile's owning process the way you normally do (Desktop, TUI or gateway), and only that profile. Do not mass-roll out every profile.
 
-The installed folder is `<HERMES_HOME>/plugins/floorplan`; each profile has its own `HERMES_HOME`, its own enabled list and its own installed bytes. Installing or enabling in one profile does not change another.
+Run the checksum check from a clone of that same release: its `CHECKSUMS.txt` and `tools/checksums.mjs` are the reference. The installed folder is `<HERMES_HOME>/plugins/floorplan`; each profile has its own `HERMES_HOME`, its own enabled list and its own installed bytes. Installing or enabling in one profile does not change another.
 
-`plugins doctor --ci` is necessary, not sufficient: it checks the manifest, the skill and the command registration. It does not prove a provider route, a source read or an inference.
+`plugins doctor --ci` is necessary, not sufficient: it parses the manifest, imports the plugin, runs its registration and reports its hook/tool/MCP counts (none here). It does not prove a provider route, a source read or an inference.
 
 ## Use it
 

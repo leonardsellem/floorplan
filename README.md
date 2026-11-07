@@ -199,7 +199,7 @@ Install one profile from a pinned commit SHA, verify the checksums, then enable 
 
 ```bash
 hermes --profile <profile> plugins install leonardsellem/floorplan --ref <40-character-sha> --no-enable
-node tools/checksums.mjs --check <installed plugin folder>
+node <release clone>/tools/checksums.mjs --check <installed plugin folder>
 hermes --profile <profile> plugins doctor <installed plugin folder> --ci
 hermes --profile <profile> plugins enable floorplan
 ```
