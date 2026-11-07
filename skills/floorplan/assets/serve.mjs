@@ -98,7 +98,10 @@ if (has('export')) {
 }
 const wantPort = Number(opt('port', 4378));
 const idleExit = Number(opt('idle-exit', 0)) * 60000; // stop this long after the last tab closes (0 = never)
-const selfHash = crypto.createHash('sha1').update(fs.readFileSync(fileURLToPath(import.meta.url))).digest('hex').slice(0, 12);
+// the generated server and the helper beside it are one revision: --check and open.mjs hash both
+const helperFile = path.join(here, 'hermes-boundary.mjs');
+const selfHash = crypto.createHash('sha1').update(fs.readFileSync(fileURLToPath(import.meta.url)))
+  .update(fs.existsSync(helperFile) ? fs.readFileSync(helperFile) : '').digest('hex').slice(0, 12);
 const model = opt('model', process.env.FLOORPLAN_MODEL || '');
 let profile = opt('profile', process.env.FLOORPLAN_PROFILE || '');
 const token = crypto.randomBytes(16).toString('hex');
@@ -149,12 +152,17 @@ function codexApp() {
 // CLI reads its schema from a file rather than the command line. protocol: the engine speaks LS-3919's
 // newline-delimited JSON worker protocol instead (hermesAsk), and its find() also probes the install.
 let hermesInstall = null;
+let hermesFailure = null;
+const HERMES_PROTOCOL = 1;
 function hermesProbe(bin) {
   try {
     const out = execFileSync(bin.cmd, [...bin.args, ...(profile ? ['--profile', profile] : []), 'floorplan', 'probe'],
       { encoding: 'utf8', timeout: 20000, stdio: ['ignore', 'pipe', 'ignore'], windowsHide: true });
     const p = JSON.parse(out);
-    if (p?.plugin !== 'floorplan' || p.protocol !== 1 || p.ask !== 'ready' || typeof p.skill_dir !== 'string') return null;
+    if (p?.plugin !== 'floorplan') return null;
+    // this generated server speaks one protocol; a newer installed plugin needs a rebuilt map
+    if (p.protocol !== HERMES_PROTOCOL) { hermesFailure = 'protocol_mismatch'; return null; }
+    if (p.ask !== 'ready' || typeof p.skill_dir !== 'string') { hermesFailure = p.ask === 'unsupported_runtime' ? 'unsupported_runtime' : null; return null; }
     return p;
   } catch { return null; }
 }
@@ -190,6 +198,10 @@ const ENGINES = {
 // --engine (or FLOORPLAN_ENGINE) decides; otherwise the agent that built the map, then the others in order
 const builtBy = (() => { try { return JSON.parse(fs.readFileSync(path.join(here, 'graph.json'), 'utf8')).meta?.agent; } catch { return null; } })();
 const asked = opt('engine', process.env.FLOORPLAN_ENGINE);
+// what the caller asked for, recorded in .cache/server.json so open.mjs can restart on a change
+const startedWith = { engine: asked || null, model: model || null, profile: profile || null,
+  hermes: opt('hermes', process.env.FLOORPLAN_HERMES) || null, claude: opt('claude', process.env.FLOORPLAN_CLAUDE) || null,
+  codex: opt('codex', process.env.FLOORPLAN_CODEX) || null };
 const isEngine = (k) => typeof k === 'string' && Object.hasOwn(ENGINES, k);
 const want = isEngine(asked) ? asked : isEngine(builtBy) ? builtBy : 'claude';
 let engine = null, cli = null;
@@ -215,7 +227,7 @@ if (cli) { try { version = execFileSync(cli.cmd, [...cli.args, '--version'], { e
 
 // The page, the graph, and the instructions and answer schema (from query.mjs's inlined graph-query
 // code). Loaded at start and again whenever the map is rebuilt.
-const inject = `<script>window.FLOORPLAN_SERVER=${JSON.stringify({ token, cli: !!cli, engine, want, version, model: model || null, profile: profile || null, source: engine === 'hermes' ? !!findIssues : null, change: canChange })};</script>`;
+const inject = `<script>window.FLOORPLAN_SERVER=${JSON.stringify({ token, cli: !!cli, engine, want, version, model: model || null, profile: profile || null, source: engine === 'hermes' ? !!findIssues : null, change: canChange, error: engine ? null : (want === 'hermes' ? hermesFailure : null) })};</script>`;
 const ENGINE_LANG = (k) => (k === 'hermes' ? 'hermes' : 'cli');
 // Server-owned follow-up store: a handle is bound to root, the loaded build, graph digest, engine, profile and mode.
 const conversations = new Map();
@@ -1234,7 +1246,7 @@ const server = http.createServer((req, res) => {
       return;
     }
     if (req.method === 'GET' && url.pathname === '/api/status') { res.writeHead(200, { 'Content-Type': 'application/json' }); return res.end(JSON.stringify({ tabs: tabs.size, pid: process.pid, hash: selfHash, root })); }
-    if (req.method === 'GET' && url.pathname === '/api/health') { res.writeHead(200, { 'Content-Type': 'application/json' }); return res.end(JSON.stringify({ cli: !!cli, engine, want, version, path: cli?.path || null })); }
+    if (req.method === 'GET' && url.pathname === '/api/health') { res.writeHead(200, { 'Content-Type': 'application/json' }); return res.end(JSON.stringify({ cli: !!cli, engine, want, version, path: cli?.path || null, error: engine ? null : (want === 'hermes' ? hermesFailure : null) })); }
     // requested flows are saved next to the map; build.mjs folds them into graph.json
     if (url.pathname === '/api/flows') {
       if (req.method === 'GET') { res.writeHead(200, { 'Content-Type': 'application/json' }); return res.end(JSON.stringify({ flows: readFlows() })); }
@@ -1358,7 +1370,7 @@ server.on('listening', () => {
   const u = `http://127.0.0.1:${port}`;
   try {
     fs.mkdirSync(path.dirname(stateFile), { recursive: true });
-    fs.writeFileSync(stateFile, JSON.stringify({ pid: process.pid, port, url: u, token, hash: selfHash, startedAt: new Date().toISOString() }, null, 2));
+    fs.writeFileSync(stateFile, JSON.stringify({ pid: process.pid, port, url: u, token, hash: selfHash, opts: startedWith, startedAt: new Date().toISOString() }, null, 2));
   } catch {}
   const forget = () => { try { if (readState()?.pid === process.pid) fs.unlinkSync(stateFile); } catch {} };
   process.on('exit', forget);
