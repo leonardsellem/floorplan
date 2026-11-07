@@ -10,6 +10,7 @@ Plugins for Claude Code and Codex can run code on your computer, so it's worth a
 - **Never downloads anything, and never runs code from the internet.** No `eval`, no encoded payloads. It loads two local files and nothing else: the map's lookup code from `floorplan/query.mjs` (which the build wrote) and, for Hermes Ask, the installed skill's own `health.mjs` from the folder the install's model-free probe names.
 - **Never changes your code.** It writes only its own `floorplan/` folder and, in Claude Code and only if you say yes, a marked section of `CLAUDE.local.md`. See [What's in your project](project-files.md).
 - **No analytics or tracking.**
+- **Hermes adds a small native plugin, still nothing that runs on its own.** Three native files are executable surfaces: `plugin.yaml` (the manifest: `provides_hooks: []`, no MCP servers, no tools, no pip dependencies), `__init__.py` (registers one skill and one on-demand command), and `hermes/runner.py` (the model-free probe and the bounded Ask worker). They are fingerprinted in `CHECKSUMS.txt` like the rest of the release, and the same supply-chain test covers them.
 
 ## Everything it does
 
@@ -56,12 +57,14 @@ In Claude Code, while the skill is in use, it pre-approves one kind of command: 
 
 [`tests/supply-chain.test.mjs`](../tests/supply-chain.test.mjs) runs on every push and pull request, on Linux and Windows (and weekly on macOS). It fails if a change would:
 
-- add a hook, an MCP server, a dependency or an install script;
+- add a hook, an MCP server, a dependency or an install script, including one declared in the Hermes manifest;
 - send a request anywhere other than the map's own server and the waitlist;
+- import a network module or start a subprocess from the Python worker, or open a file without `O_NOFOLLOW`;
 - start a program not in the table above, or start one through a shell;
 - use `eval`, load code at run time, or hide a long encoded string in the code;
 - add a script that would run without asking;
-- change the bundled layout engine, or add a vendored file.
+- change the bundled layout engine, or add a vendored file;
+- let `CHECKSUMS.txt` miss a Python or YAML runtime file, or go stale when one changes (a changed, extra or missing file fails the check).
 
 Each check was tested by planting exactly that kind of change and seeing it fail. A change to any of this has to change the test and this page together, in the open.
 
@@ -73,7 +76,7 @@ node --test tests/supply-chain.test.mjs
 
 ## Check that your installed copy is a real release
 
-Every release includes `CHECKSUMS.txt`: a SHA-256 fingerprint of every file the plugin runs from (the skill, the plugin manifests and the marketplace files). To compare your installed copy with the release on GitHub:
+Every release includes `CHECKSUMS.txt`: a SHA-256 fingerprint of every file the plugin runs from (the skill, the native Hermes runtime, the plugin manifests and the marketplace files). To compare your installed copy with the release on GitHub:
 
 ```bash
 git clone --depth 1 --branch floorplan--v<version> https://github.com/haydenschmitty/floorplan floorplan-check

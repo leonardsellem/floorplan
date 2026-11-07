@@ -45,8 +45,13 @@ let status = s?.pid && alive(s.pid) ? await api(s, '/api/status') : null;
 let restarted = false;
 const hadTabs = status?.tabs > 0;
 
-if (status && status.hash !== hash) {
-  // a newer serve.mjs came with this build: restart so the map gets it; open tabs reconnect and reload
+// a different engine, model, profile or CLI path is a different server: restart it rather than reuse it
+const ASKED = ['engine', 'model', 'profile', 'claude', 'codex', 'hermes'];
+const askedChanged = !!s && (ASKED.some((k) => args[k] && String(args[k]) !== String(s.opts?.[k] ?? ''))
+  || (args.port && String(args.port) !== String(s.port)));
+if (status && (status.hash !== hash || askedChanged)) {
+  // a newer serve.mjs or helper came with this build, or the caller changed what the server answers with:
+  // restart so the map gets it; open tabs reconnect and reload
   try { process.kill(s.pid); } catch {}
   for (let i = 0; i < 20 && alive(s.pid); i++) await sleep(150);
   status = null;
@@ -86,6 +91,7 @@ console.log(`FLOORPLAN  ${s.url}  (${shown})`);
 const CLI = {
   claude: { name: 'the Claude Code CLI', docs: 'https://docs.claude.com/en/docs/claude-code' },
   codex: { name: 'Codex', docs: 'https://developers.openai.com/codex' },
+  hermes: { name: 'Hermes', docs: 'https://hermes-agent.nousresearch.com/docs' },
 };
 console.log(health?.cli
   ? `ASK  works: questions run through ${CLI[health.engine]?.name || 'the Claude Code CLI'}${health.version ? ' (' + health.version + ')' : ''}`
