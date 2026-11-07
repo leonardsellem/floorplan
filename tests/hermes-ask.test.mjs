@@ -59,7 +59,7 @@ async function serve(root, env = {}) {
   });
   const html = await (await fetch(base + '/')).text();
   const page = JSON.parse(/window\.FLOORPLAN_SERVER=(\{.*?\});/.exec(html)[1]);
-  return { base, token: page.token, page, log, server, calls: () => { try { return fs.readFileSync(log, 'utf8').trim().split('\n').filter(Boolean).map((l) => JSON.parse(l)); } catch { return []; } } };
+  return { base, token: page.token, page, log, server, output: () => out, calls: () => { try { return fs.readFileSync(log, 'utf8').trim().split('\n').filter(Boolean).map((l) => JSON.parse(l)); } catch { return []; } } };
 }
 
 /** Starts one ask and collects its server-sent events as they arrive. */
@@ -351,4 +351,95 @@ t('the page has copy for every typed failure code', () => {
   const block = /const FAILURE_COPY = \{([\s\S]*?)\n\};/.exec(viewer)[1];
   const codes = [...block.matchAll(/^[ ]{2}([a-z_]+):/gm)].map((m) => m[1]).sort();
   assert.deepEqual(codes, [...FAILURE_CODES].sort());
+});
+
+// --- LS-4046: a stored conversation belongs to the build that accepted it ---
+const until = async (fn, ms, what) => {
+  const end = Date.now() + ms;
+  while (Date.now() < end) { const v = fn(); if (v) return v; await new Promise((r) => setTimeout(r, 25)); }
+  assert.fail(`no ${what} within ${ms / 1000} s`);
+};
+const startFrame = (s, prefix) => s.calls().filter((f) => f.type === 'start' && String(f.question || '').startsWith(prefix)).pop() || null;
+const reloaded = async (s, mark, ms = 30000) => {
+  const end = Date.now() + ms;
+  while (Date.now() < end) {
+    if (s.output().slice(mark).includes('map rebuilt: reloaded open tabs')) return;
+    await new Promise((r) => setTimeout(r, 100));
+  }
+  assert.fail(`no reload within ${ms / 1000} s after the build; server output: ${s.output().slice(mark)}`);
+};
+const noWorker = (s, before) => s.calls().slice(before).filter((f) => f.type === 'start').length;
+
+t('a rebuild never re-binds a follow-up answered after it', async () => {
+  const root = shop();
+  const s = await serve(root);
+  const [first] = pick(await ask(s, 'What is this?'), 'answer');
+  const [same] = pick(await ask(s, 'And then?', first.session), 'answer');
+  assert.equal(same?.session, first.session, 'on one build the handle keeps its thread');
+
+  const held = open(s, 'HOLD until released', first.session);
+  await held.waitFor('start');
+  const accepted = await until(() => startFrame(s, 'HOLD until released'), 15000, 'the held follow-up reached the worker');
+  const mark = s.output().length;
+  run('build.mjs', root, '--no-claude-md', '--agent', 'hermes');
+  await reloaded(s, mark);
+  fs.writeFileSync(path.join(root, 'release'), '1');
+  const [late] = pick(await held.done, 'answer');
+  assert.equal(late?.session, first.session, 'the in-flight answer was delivered');
+
+  const [fresh] = pick(await ask(s, 'A fresh question after the build'), 'answer');
+  const built = startFrame(s, 'A fresh question after the build');
+  assert.ok(fresh && built, 'a fresh request is answered on the new build');
+  assert.notEqual(built.graph_digest, accepted.graph_digest, 'the rebuild changed the graph digest');
+
+  const before = s.calls().length;
+  const events = await ask(s, 'And after the rebuild?', first.session);
+  assert.equal(pick(events, 'failure')[0]?.code, 'session_expired');
+  assert.equal(pick(events, 'answer').length, 0);
+  assert.equal(noWorker(s, before), 0, 'the expired handle started no worker');
+});
+
+t('a first question answered after a rebuild mints no handle for the new map', async () => {
+  const root = shop();
+  const s = await serve(root);
+  const held = open(s, 'HOLD first question');
+  await held.waitFor('start');
+  const accepted = await until(() => startFrame(s, 'HOLD first question'), 15000, 'the held first question reached the worker');
+  const mark = s.output().length;
+  run('build.mjs', root, '--no-claude-md', '--agent', 'hermes');
+  await reloaded(s, mark);
+  fs.writeFileSync(path.join(root, 'release'), '1');
+  const [answer] = pick(await held.done, 'answer');
+  assert.match(answer?.session || '', /^[0-9a-f]{16}$/, 'the answer minted a handle');
+
+  const [fresh] = pick(await ask(s, 'A fresh question after the build'), 'answer');
+  const built = startFrame(s, 'A fresh question after the build');
+  assert.ok(fresh && built, 'a fresh request is answered on the new build');
+  assert.notEqual(built.graph_digest, accepted.graph_digest, 'the rebuild changed the graph digest');
+
+  const before = s.calls().length;
+  const events = await ask(s, 'And after the rebuild?', answer.session);
+  assert.equal(pick(events, 'failure')[0]?.code, 'session_expired');
+  assert.equal(pick(events, 'answer').length, 0);
+  assert.equal(noWorker(s, before), 0, 'the minted handle started no worker');
+});
+
+t('a follow-up answered before a rebuild still expires after it', async () => {
+  const root = shop();
+  const s = await serve(root);
+  const [first] = pick(await ask(s, 'What is this?'), 'answer');
+  const held = open(s, 'HOLD until released', first.session);
+  await held.waitFor('start');
+  await until(() => startFrame(s, 'HOLD until released'), 15000, 'the held follow-up reached the worker');
+  fs.writeFileSync(path.join(root, 'release'), '1');
+  const [answer] = pick(await held.done, 'answer');
+  assert.equal(answer?.session, first.session, 'the follow-up was answered before the build');
+  const mark = s.output().length;
+  run('build.mjs', root, '--no-claude-md', '--agent', 'hermes');
+  await reloaded(s, mark);
+  const before = s.calls().length;
+  const events = await ask(s, 'And after the rebuild?', first.session);
+  assert.equal(pick(events, 'failure')[0]?.code, 'session_expired');
+  assert.equal(pick(events, 'answer').length, 0);
+  assert.equal(noWorker(s, before), 0);
 });
