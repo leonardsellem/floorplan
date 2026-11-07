@@ -30,7 +30,8 @@ MAX_DECISIONS = 8
 MAX_LOOKUPS = 7
 MAX_QUESTION = 4000
 CALL_SECONDS = 60
-DEADLINE_SECONDS = 180
+DEADLINE_SECONDS = 180  # Ask and a guided flow
+CHANGE_DEADLINE_SECONDS = 300  # a complete Change, including its one validation retry
 REDACTED = "[redacted: known secret]"
 
 SUPPORTED = os.name == "posix" and hasattr(os, "O_NOFOLLOW") and os.open in os.supports_dir_fd
@@ -296,7 +297,7 @@ class _Session:
             self.reader = ConfinedReader(self.root)
         except OSError as exc:
             return self.fail("cli_error", f"root: {_reason(exc)}")
-        self.deadline = self.now() + DEADLINE_SECONDS
+        self.deadline = self.now() + (CHANGE_DEADLINE_SECONDS if self.mode == "change" else DEADLINE_SECONDS)
         try:
             self.send({"type": "ready", "profile": self.profile, "plugin": PLUGIN, "protocol": PROTOCOL})
             return self.decide(start)
