@@ -6,8 +6,8 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import crypto from 'node:crypto';
-import { spawn } from 'node:child_process';
-import { REPO, SKILL, shopApp, run, cleanup } from './helpers.mjs';
+import { spawn, execFileSync } from 'node:child_process';
+import { REPO, SKILL, shopApp, makeProject, run, cleanup } from './helpers.mjs';
 import { FAILURE_CODES } from '../skills/floorplan/assets/hermes-boundary.mjs';
 
 const FAKE = path.join(REPO, 'tests', 'fixtures', 'fake-cli', 'fake-hermes.mjs');
@@ -442,4 +442,34 @@ t('a follow-up answered before a rebuild still expires after it', async () => {
   assert.equal(pick(events, 'failure')[0]?.code, 'session_expired');
   assert.equal(pick(events, 'answer').length, 0);
   assert.equal(noWorker(s, before), 0);
+});
+
+test('a build writes index.html last, so a server reloading on it never reads a half-written map', () => {
+  const traced = (root, args) => {
+    const hook = path.join(root, 'trace-writes.cjs');
+    fs.writeFileSync(hook, [
+      `const fs = require('node:fs');`,
+      `// shortcut: traces writeFileSync and copyFileSync only, the two calls build.mjs writes the map folder with; extend if build.mjs gains another writer`,
+      `const { writeFileSync, copyFileSync } = fs;`,
+      `const log = (p) => writeFileSync(process.env.FLOORPLAN_WRITES, p + '\\n', { flag: 'a' });`,
+      `fs.writeFileSync = (p, ...rest) => { log(p); return writeFileSync(p, ...rest); };`,
+      `fs.copyFileSync = (from, to, ...rest) => { log(to); return copyFileSync(from, to, ...rest); };`,
+    ].join('\n'));
+    const log = path.join(root, 'writes.log');
+    fs.writeFileSync(log, '');
+    execFileSync(process.execPath, ['--require', hook, path.join(SKILL, 'scripts', 'build.mjs'), root, '--no-claude-md', ...args], { cwd: root, env: { ...process.env, FLOORPLAN_WRITES: log }, stdio: 'pipe' });
+    return fs.readFileSync(log, 'utf8').split('\n').filter(Boolean)
+      .map((p) => path.relative(path.join(root, 'floorplan'), p).split(path.sep).join('/'))
+      .filter((p) => p !== '.gitignore' && !p.startsWith('..'));
+  };
+
+  const codeMap = traced(shop(), ['--agent', 'hermes', '--artifact']);
+  assert.deepEqual(codeMap, ['graph.json', 'artifact.html', 'query.mjs', 'serve.mjs', 'hermes-boundary.mjs', 'index.html'], codeMap.join(' -> '));
+
+  const blueprint = makeProject({});
+  fs.cpSync(path.join(REPO, 'tests', 'fixtures', 'blueprint'), blueprint, { recursive: true });
+  run('plan.mjs', blueprint);
+  roots.push(blueprint);
+  const planned = traced(blueprint, []);
+  assert.deepEqual(planned, ['graph.json', 'query.mjs', 'serve.mjs', 'hermes-boundary.mjs', '.cache/skill.json', 'index.html'], planned.join(' -> '));
 });
